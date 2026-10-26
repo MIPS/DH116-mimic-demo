@@ -1,0 +1,40 @@
+# Build output (build.sh, build-riscv.sh, CMake presets) and release bundles.
+/build/
+/dist/
+cmake-build*/
+cmake/
+CMakePresets.json
+CMakeUserPresets.json
+
+# CMake caches and generated build-system files (including in-source builds).
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+CPackConfig.cmake
+CPackSourceConfig.cmake
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest*.txt
+Makefile
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Compiled outputs.
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+/dh116_move
+/src/dh116_move
+/dh116_teleop
+/hand_cam
+/retarget_test
+trash/
