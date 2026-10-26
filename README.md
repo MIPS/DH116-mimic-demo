@@ -25,18 +25,6 @@ DH116_IFACE=enp0s31f6 ./scripts/run.sh                    # hardware run; see `i
 ./scripts/run.sh --dry-run                                # camera and inference only; no EtherCAT, no sudo
 ```
 
-`scripts/run.sh` calls `scripts/build.sh` automatically when the executables are missing, so it works on a fresh checkout. After changing sources, run `./scripts/build.sh` again; it rebuilds incrementally.
-
-## Requirements
-
-- Linux for the current EtherCAT and camera launcher.
-- Git, CMake 3.28 or newer, and a C/C++ compiler (`sudo apt install git cmake build-essential`).
-- Camera frontend: OpenCV development files (`sudo apt install libopencv-dev`).
-- ONNX Runtime source build, only when no existing install is given (see [Build](#build)): Python 3.10 or newer, network access to download ONNX Runtime's own dependencies, and several GB of disk and RAM. Expect a long first build; later runs skip it.
-- Hardware use: a DH116EC hand, correctly wired external power, and a dedicated wired Ethernet interface. Verify the exact model's power requirements against its manual.
-- `sudo` for EtherCAT access. Stop any other EtherCAT master on the same interface.
-
-The controller needs neither OpenCV nor ONNX Runtime; build it alone with `./scripts/build.sh --controller-only`.
 
 ## Build
 
@@ -46,17 +34,6 @@ The controller needs neither OpenCV nor ONNX Runtime; build it alone with `./scr
 2. Checks that CMake, a compiler, and OpenCV are available before starting the long build.
 3. Builds ONNX Runtime (Release, shared library, no tests) from the submodule into `build/deps/native/ort/` and installs `lib/` and `include/` into `build/prefix/native/`. This is repeated only if the submodule revision changes.
 4. Configures and builds `dh116_teleop` and `hand_cam` into `build/native/`.
-
-| Option | Effect |
-|---|---|
-| `-j, --jobs N` | Parallel jobs. Default: the smaller of the CPU count and RAM / 3 GB. |
-| `--build-type TYPE` | `Release` (default), `Debug`, `RelWithDebInfo`, or `MinSizeRel`. |
-| `--ort-root PATH` | Use an existing ONNX Runtime prefix containing `include/` and `lib/` (or `lib64/`); skips the source build. |
-| `--controller-only` | Build only `dh116_teleop`. |
-| `--clean` | Remove `build/native/` first. |
-| `--clean-ort` | Remove the ONNX Runtime build and prefix first, forcing a rebuild. |
-
-Environment: `DH116_BUILD_ROOT` (root of all build output, default `build/`), `DH116_BUILD_TYPE`, `ONNXRUNTIME_ROOT`, and `PYTHON` (a Python 3.10+ interpreter for the ONNX Runtime build). A relative root is resolved from the repository root. `./scripts/build.sh --help` lists them.
 
 To skip the ONNX Runtime compile, point the script at an existing installation:
 
@@ -75,40 +52,13 @@ cmake --build build/native --target dh116_teleop --parallel
 
 Add `-DBUILD_HAND_CAM=ON -DONNXRUNTIME_ROOT=/path/to/onnxruntime` for the camera frontend. `SOEM_DIR` can select another SOEM source checkout. OpenCV is found through its CMake package configuration. Use a different `-B` directory when changing generators or making an independent configuration.
 
-## Run
 
-`run.sh` starts the controller and the camera frontend and stops both when either exits. It builds first only if an executable is missing. Camera options such as `--camera 1`, `--hand right`, `--flip-input`, and `--no-preview` are passed to `hand_cam`. Controller options can be supplied with `TELEOP_ARGS`, for example:
-
-```bash
-DH116_IFACE=enp0s31f6 TELEOP_ARGS="--cur 600 --deadband 80" ./scripts/run.sh
-```
-
-`./scripts/run.sh --help` lists its environment variables. `DH116_BUILD_ROOT` selects the build root to run from (the executables are in `<root>/native`) and must match the one used with `scripts/build.sh`. The shared UDP port defaults to `5006` and can be changed with `TELEOP_PORT` or `--port`.
-
-To run only the controller directly, use `./build/native/dh116_teleop --dry-run` for the no-hardware mode. A hardware run requires an interface argument, for example `sudo ./build/native/dh116_teleop enp0s31f6`.
-
-## RISC-V Static Build (RVA23)
-
-Both programs cross-compile into fully static `riscv64` executables with no shared-library dependencies, so one tarball can be copied to a board and run. The build targets the RVA23U64 profile, including the RISC-V Vector extension (RVV 1.0), and assumes a vector register length (VLEN) of at least 1024 bits.
-
-On an x86-64 or aarch64 Linux host:
+### Build for RISCV
 
 ```bash
 ./scripts/build-riscv.sh              # toolchain, OpenCV, ONNX Runtime, project, tarball
 ./scripts/build-riscv.sh --test       # same, then smoke-test under qemu-user (rva23u64, VLEN 1024)
 ```
-
-The result is `dist/dh116-riscv64-rva23.tar.gz` (with a `.sha256` file). Finished steps are skipped on later runs.
-
-| Option | Effect |
-|---|---|
-| `-j, --jobs N` | Parallel jobs. Default: the smaller of the CPU count and RAM / 3 GB. |
-| `--controller-only` | Build only `dh116_teleop` (no OpenCV or ONNX Runtime; a few seconds). |
-| `--test` | Run the bundle under `qemu-riscv64 -cpu rva23u64,vlen=1024`. Needs `qemu-user`; the video test also needs Python with `cv2` and `numpy`. |
-| `--clean` | Remove the project build and the bundle first. |
-| `--clean-deps` | Also remove the OpenCV and ONNX Runtime builds and the riscv64 prefix. The cross compiler and OpenCV source stay cached. |
-
-Environment: `DH116_BUILD_ROOT` (shared with `scripts/build.sh`, default `build/`), `PYTHON`, and `QEMU`.
 
 What the script does:
 
@@ -125,7 +75,22 @@ Limitations:
 - `hand_cam` is headless in this build: it always runs with `--no-preview`, so there is no window and no `o`/`f`/`r` calibration keys. Calibrate with the native build and copy `hand_calibration.json` into the bundle before running.
 - Verified only under QEMU emulation (the controller in `--dry-run`, and `hand_cam` on a synthetic MJPEG clip). Not verified on real RISC-V hardware, with a real camera, or against a DH116 on EtherCAT.
 
-### Run on the Board
+
+
+
+## Run
+
+`run.sh` starts the controller and the camera frontend and stops both when either exits. It builds first only if an executable is missing. 
+
+Camera options such as `--camera 1`, `--hand right`, `--flip-input`, and `--no-preview` are passed to `hand_cam`. 
+Controller options can be supplied with `TELEOP_ARGS`, for example:
+```bash
+DH116_IFACE=enp0s31f6 TELEOP_ARGS="--cur 600 --deadband 80" ./scripts/run.sh
+```
+The shared UDP port defaults to `5006` and can be changed with `TELEOP_PORT` or `--port`.
+
+
+### Run on the RISCV Board
 
 The board needs a riscv64 Linux kernel with RVV enabled (`grep isa /proc/cpuinfo` should show `v`) and a V4L2 camera. Copy and unpack the bundle:
 
@@ -153,36 +118,7 @@ sudo ./bin/dh116_teleop eth1 --calibration hand_calibration.json      # hardware
 
 `--model` only selects the directory that holds `hand_palm.onnx` and `hand_landmark_detector.onnx`; the `.task` file is not shipped. Lower `--width`, `--height`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
 
-## Build Outputs
 
-Generated files stay out of the source tree. `build/` and `dist/` are ignored by Git and can be deleted safely:
-
-```text
-build/
-  native/                  # project build: dh116_teleop, hand_cam
-  riscv64/                 # riscv64 project build
-  deps/                    # dependency build trees (disposable)
-    native/ort/
-    riscv64/{opencv,ort}/
-  prefix/                  # installed dependencies the projects link against
-    native/{lib,include}   # ONNX Runtime
-    riscv64/               # static OpenCV and ONNX Runtime
-  src/opencv-4.10.0/       # downloaded OpenCV source
-  toolchain/riscv64/       # unpacked cross compiler, if none was on PATH
-  logs/riscv64/            # one log per long build step
-  tools/                   # optional extras, for example SOEM's slaveinfo
-dist/                      # riscv64 bundle directory, tarball, and checksum
-```
-
-Each target has its own project directory, and dependency build trees are kept apart from the installed prefixes, caches, and release artifacts. `--clean` therefore removes only a project build, and `--clean-ort` and `--clean-deps` leave the toolchain and downloaded sources in place.
-
-The optional hardware retarget test can be enabled with `-DBUILD_RETARGET_TEST=ON`. For SOEM's `slaveinfo` utility, use a separate build tree under `build/tools/`:
-
-```bash
-cmake -S third_party/SOEM -B build/tools/soem \
-  -DSOEM_BUILD_SAMPLES=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build/tools/soem --target slaveinfo --parallel
-```
 
 ## Repository Map
 
@@ -205,10 +141,14 @@ cmake --build build/tools/soem --target slaveinfo --parallel
 
 The top-level CMake project builds `dh116_teleop`, `hand_cam` (optional), and `retarget_test` (optional).
 
-## EtherCAT Behavior and Safety
 
-The controller checks the first slave's vendor/product IDs and expected 64-byte output and 192-byte input mapping, transitions the bus to Operational, initializes and enables the joints, then streams targets. A working counter below `3` for 20 consecutive cycles causes a bus fault and exit. Normal cycle timing is 5 ms but is not hard real-time.
+## Requirements
 
-On GUI quit or a controller signal, the controller attempts to open the hand, disable the joints, and return the bus to INIT. A lost camera or tracking hand holds the most recent pose. These behaviors are not an emergency stop and cannot guarantee release. Keep clear of the whole hand and provide an accessible hardware power cutoff. Current limit is not calibrated force; start with conservative settings and follow the manufacturer's guidance.
+- Linux for the current EtherCAT and camera launcher.
+- Git, CMake 3.28 or newer, and a C/C++ compiler (`sudo apt install git cmake build-essential`).
+- Camera frontend: OpenCV development files (`sudo apt install libopencv-dev`).
+- ONNX Runtime source build, only when no existing install is given (see [Build](#build)): Python 3.10 or newer, network access to download ONNX Runtime's own dependencies, and several GB of disk and RAM. Expect a long first build; later runs skip it.
+- Hardware use: a DH116EC hand, correctly wired external power, and a dedicated wired Ethernet interface. Verify the exact model's power requirements against its manual.
+- `sudo` for EtherCAT access. Stop any other EtherCAT master on the same interface.
 
-Do not run multiple EtherCAT masters against the same hand.
+The controller needs neither OpenCV nor ONNX Runtime; build it alone with `./scripts/build.sh --controller-only`.
