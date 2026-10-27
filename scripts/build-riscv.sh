@@ -18,7 +18,7 @@ Options:
   -j, --jobs N         Parallel jobs (default: min(CPU count, RAM / 3 GB))
   --controller-only    Build only dh116_teleop (no OpenCV or ONNX Runtime)
   --test               After building, smoke-test the bundle under qemu-user
-                       (-cpu rva23u64,vlen=1024)
+                       (-cpu rva23u64,vlen=$QEMU_VLEN; default 256, as on the SpacemiT K3)
   --clean              Delete the project build and the bundle first
   --clean-deps         Also delete the OpenCV and ONNX Runtime builds
   -h, --help           Show this help
@@ -28,6 +28,7 @@ Environment:
                        is written to <repo>/dist
   PYTHON               Python 3.10+ interpreter used for the ONNX Runtime build
   QEMU                 qemu-user binary for --test (default: qemu-riscv64)
+  QEMU_VLEN            vector length in bits for --test (default 256; use 1024 for the FPGA)
 EOF
 }
 
@@ -49,6 +50,7 @@ BUILD_ROOT="${DH116_BUILD_ROOT:-$REPO_ROOT/build}"
 [[ "$BUILD_ROOT" == /* ]] || BUILD_ROOT="$REPO_ROOT/$BUILD_ROOT"
 PYTHON="${PYTHON:-python3}"
 QEMU="${QEMU:-qemu-riscv64}"
+QEMU_VLEN="${QEMU_VLEN:-256}"
 JOBS=""
 CONTROLLER_ONLY=0
 RUN_TESTS=0
@@ -397,7 +399,7 @@ EOF
 }
 
 smoke_test() {
-    local port=5106 cpu="rva23u64,vlen=1024" clip="$LOGS/test-clip.avi" out status=0
+    local port=5106 cpu="rva23u64,vlen=$QEMU_VLEN" clip="$LOGS/test-clip.avi" out status=0
     command -v "$QEMU" >/dev/null || die "$QEMU not found (install qemu-user, or set QEMU=/path/to/qemu-riscv64)"
     mkdir -p "$LOGS"
 

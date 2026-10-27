@@ -57,7 +57,7 @@ Add `-DBUILD_HAND_CAM=ON -DONNXRUNTIME_ROOT=/path/to/onnxruntime` for the camera
 
 ```bash
 ./scripts/build-riscv.sh              # toolchain, OpenCV, ONNX Runtime, project, tarball
-./scripts/build-riscv.sh --test       # same, then smoke-test under qemu-user (rva23u64, VLEN 1024)
+./scripts/build-riscv.sh --test       # same, then smoke-test under qemu-user (rva23u64, VLEN 256; set QEMU_VLEN=1024 for the FPGA)
 ```
 
 What the script does:
@@ -68,7 +68,7 @@ What the script does:
 4. Builds `dh116_teleop` and `hand_cam` with [cmake/toolchains/riscv64-rva23-static.cmake](cmake/toolchains/riscv64-rva23-static.cmake), `-DHAND_CAM_HEADLESS=ON`, and static linking, then checks that both are static RISC-V ELF files.
 5. Packs `bin/`, `models/`, `hand_calibration.json`, and `run.sh` into the tarball.
 
-The toolchain file spells out the RVA23U64 extensions in `-march` because GCC 15 does not accept `-march=rva23u64`; the string ends in `zvl1024b`, which lets the compiler assume VLEN >= 1024. The generated vector code does not depend on the exact length, but hardware with a shorter VLEN is not supported by this build. To target it, remove `_zvl1024b` from `RVA23_MARCH` in the toolchain file and rebuild with `--clean-deps`.
+The toolchain file spells out the RVA23U64 extensions in `-march` because GCC 15 does not accept `-march=rva23u64`. It deliberately has no `zvl*b` suffix: a `zvl1024b` build lets the compiler assume VLEN >= 1024 and segfaults on shorter-vector cores such as the SpacemiT K3 (VLEN 256), whereas the default build runs on any VLEN. After changing `-march`, rebuild with `--clean-deps`; finished OpenCV and ONNX Runtime steps are otherwise skipped.
 
 Limitations:
 
@@ -119,6 +119,10 @@ sudo ./bin/dh116_teleop eth1 --calibration hand_calibration.json      # hardware
 `--model-dir` is the directory that holds `hand_palm.onnx` and `hand_landmark_detector.onnx` (default `models`). Lower `--width`, `--height`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
 
 To estimate inference time on any device before building anything, run `python3 scripts/bench_models.py` (needs only `pip install onnxruntime numpy`). It times both networks for several thread counts and prints the expected per-frame model cost; `--threads 1,2,4,8` sweeps counts and `taskset -c ...` pins it to chosen cores.
+
+`scripts/quantize_models.py --source <clip or images or camera index>` (dev host; needs `onnx`, `opencv-python-headless` too) writes int8 versions to `models/int8/` and reports accuracy against fp32. Time them on the device with `bench_models.py --model-dir models/int8`. To time the ONNX Runtime that `hand_cam` is actually linked against (e.g. the RVV build), run `./bin/hand_cam --bench --threads 8 [--model-dir models/int8]`; it needs no camera. This is experimental: with sample images only, the palm net still loses the hand in a fifth of frames and the landmark world error is ~5 mm, so calibrate on a real clip before trusting it.
+
+`./bin/hand_cam --camera 1 --profile` prints the average time per frame in each stage (camera wait, palm, landmark, draw+show) every 30 frames; use it to see where a slow live run loses its time.
 
 
 

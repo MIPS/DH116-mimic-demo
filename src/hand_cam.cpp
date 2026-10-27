@@ -28,6 +28,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -148,6 +149,9 @@ struct Options
 
     bool flip_input = false;
     bool no_preview = false;
+    bool bench = false;
+    bool profile = false;
+    int bench_iters = 100;
 
     int frames = 0;
     int threads = 8;
@@ -170,6 +174,9 @@ void print_usage(const char* argv0)
         << "  --frames N            Stop after N frames; 0 means unlimited\n"
         << "  --threads N           ONNX intra-op threads (default 8)\n"
         << "  --det-every N         Palm detection interval (default 30)\n"
+        << "  --profile             Print average time per stage every 30 frames\n"
+        << "  --bench               Time both models on dummy input and exit (no camera needed)\n"
+        << "  --bench-iters N       Timed runs per model for --bench (default 100)\n"
         << "  --help                Show this help\n";
 }
 
@@ -208,6 +215,12 @@ Options parse_args(int argc, char** argv)
             opts.model_dir = value(i, arg);
         else if (arg == "--flip-input")
             opts.flip_input = true;
+        else if (arg == "--bench")
+            opts.bench = true;
+        else if (arg == "--profile")
+            opts.profile = true;
+        else if (arg == "--bench-iters")
+            opts.bench_iters = std::stoi(value(i, arg));
         else if (arg == "--no-preview")
             opts.no_preview = true;
         else if (arg == "--frames")
@@ -464,6 +477,10 @@ public:
         landmark_output_names_ = get_output_names(landmark_);
     }
 
+    // Milliseconds spent in the palm / landmark stages (including preprocessing) since the caller last zeroed them.
+    double palm_ms = 0.0;
+    double landmark_ms = 0.0;
+
     // want_right: once that hand is found, only it is tracked (saves a landmark pass per frame).
     std::vector<DetectedHand> detect(const cv::Mat& rgb, bool want_right)
     {
@@ -480,6 +497,7 @@ public:
 
         if (run_palm)
         {
+            const double t_palm = monotonic_seconds();
             int pad_x = 0;
             int pad_y = 0;
             double scale = 0.0;
@@ -493,6 +511,8 @@ public:
 
             tracked_ = rois_from_palm_dets(
                 palm_outputs.at(0), pad_x, pad_y, scale);
+
+            palm_ms += (monotonic_seconds() - t_palm) * 1e3;
         }
 
         std::vector<DetectedHand> result;
@@ -501,12 +521,15 @@ public:
 
         for (const ROI& roi : tracked_)
         {
+            const double t_lm = monotonic_seconds();
             cv::Mat affine;
             cv::Mat crop = make_landmark_crop(rgb, roi, affine);
 
             const auto lm_outputs = run_model(
                 landmark_, landmark_input_name_,
                 landmark_output_names_, crop, false);
+
+            landmark_ms += (monotonic_seconds() - t_lm) * 1e3;
 
             if (lm_outputs.size() < 4 ||
                 lm_outputs[0].values.size() < 63 ||
@@ -1171,6 +1194,75 @@ cv::Mat draw_preview(
 }
 
 // -----------------------------------------------------------------------------
+// --bench: same table as scripts/bench_models.py, through the ONNX Runtime linked here
+// -----------------------------------------------------------------------------
+
+int run_bench(const Options& opts)
+{
+    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DH116Bench");
+    std::mt19937 rng(0);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    double median_ms[2] = {0, 0};
+    const char* const files[2] = {"hand_palm.onnx", "hand_landmark_detector.onnx"};
+
+    std::cout << "threads " << opts.threads << ", " << opts.bench_iters << " timed runs, models "
+              << opts.model_dir << "\n\n   model    |   median     mean      p95      min  (ms)\n";
+
+    for (int m = 0; m < 2; ++m)
+    {
+        Ort::SessionOptions so;
+        so.SetIntraOpNumThreads(opts.threads);
+        so.SetInterOpNumThreads(1);
+        Ort::Session session(env, (opts.model_dir + "/" + files[m]).c_str(), so);
+
+        Ort::AllocatorWithDefaultOptions alloc;
+        const std::string in_name = session.GetInputNameAllocated(0, alloc).get();
+        std::vector<std::string> out_names;
+        for (size_t i = 0; i < session.GetOutputCount(); ++i)
+            out_names.emplace_back(session.GetOutputNameAllocated(i, alloc).get());
+        std::vector<const char*> out_ptrs;
+        for (const auto& n : out_names)
+            out_ptrs.push_back(n.c_str());
+
+        std::vector<int64_t> shape = session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+        size_t count = 1;
+        for (auto& d : shape)
+            count *= static_cast<size_t>(d = std::max<int64_t>(d, 1));
+        std::vector<float> data(count);
+        for (auto& v : data)
+            v = dist(rng);
+
+        const auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value input = Ort::Value::CreateTensor<float>(mem, data.data(), data.size(), shape.data(), shape.size());
+        const char* in_ptr = in_name.c_str();
+
+        std::vector<double> ms;
+        for (int i = 0; i < 10 + opts.bench_iters; ++i)
+        {
+            const double t0 = monotonic_seconds();
+            session.Run(Ort::RunOptions{nullptr}, &in_ptr, &input, 1, out_ptrs.data(), out_ptrs.size());
+            if (i >= 10)
+                ms.push_back((monotonic_seconds() - t0) * 1e3);
+        }
+
+        std::sort(ms.begin(), ms.end());
+        double sum = 0;
+        for (double v : ms)
+            sum += v;
+        median_ms[m] = ms[ms.size() / 2];
+        std::printf("%-10s  | %8.2f %8.2f %8.2f %8.2f\n", m == 0 ? "palm" : "landmark", median_ms[m],
+                    sum / ms.size(), ms[std::min(ms.size() - 1, static_cast<size_t>(ms.size() * 0.95))], ms[0]);
+    }
+
+    const double steady = median_ms[1];
+    const double average = steady + median_ms[0] / opts.det_every;
+    std::printf("\nper frame (palm every %d): steady %.2f ms, average %.2f ms, spike %.2f ms, %.1f fps\n",
+                opts.det_every, steady, average, steady + median_ms[0], 1000.0 / average);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 
@@ -1195,6 +1287,19 @@ int main(int argc, char** argv)
 #ifdef HAND_CAM_HEADLESS
     args.no_preview = true;
 #endif
+
+    if (args.bench)
+    {
+        try
+        {
+            return run_bench(args);
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "bench error: " << e.what() << "\n";
+            return 2;
+        }
+    }
 
     const std::string model_dir = args.model_dir;
     const std::string palm_path =
@@ -1277,11 +1382,18 @@ int main(int argc, char** argv)
 
     int exit_code = 0;
 
+    // --profile accumulators (ms), reported every PROFILE_EVERY frames.
+    constexpr int PROFILE_EVERY = 30;
+    double prof_wait = 0.0, prof_detect = 0.0, prof_show = 0.0;
+    int prof_n = 0;
+    landmarker->palm_ms = landmarker->landmark_ms = 0.0;
+
     try
     {
         while (!g_interrupted.load() &&
                (!args.frames || frames < args.frames))
         {
+            const double t_loop = monotonic_seconds();
             cv::Mat image;
             double stamp = 0.0;
 
@@ -1305,6 +1417,8 @@ int main(int argc, char** argv)
                     break;
             }
 
+            const double t_got = monotonic_seconds();
+
             if (args.flip_input)
                 cv::flip(image, image, 1);
 
@@ -1313,6 +1427,8 @@ int main(int argc, char** argv)
 
             const std::vector<DetectedHand> hands =
                 landmarker->detect(rgb, right);
+
+            const double t_detected = monotonic_seconds();
 
             int selected = -1;
             float selected_score = -1.0f;
@@ -1366,6 +1482,31 @@ int main(int argc, char** argv)
 
             previous = now;
 
+            const auto report = [&](double show_ms)
+            {
+                if (!args.profile)
+                    return;
+
+                prof_wait += (t_got - t_loop) * 1e3;
+                prof_detect += (t_detected - t_got) * 1e3;
+                prof_show += show_ms;
+
+                if (++prof_n < PROFILE_EVERY)
+                    return;
+
+                std::printf(
+                    "profile/frame ms: wait-camera %.1f | detect %.1f "
+                    "(palm %.1f, landmark %.1f) | draw+show %.1f\n",
+                    prof_wait / prof_n, prof_detect / prof_n,
+                    landmarker->palm_ms / prof_n,
+                    landmarker->landmark_ms / prof_n, prof_show / prof_n);
+                std::fflush(stdout);
+
+                prof_wait = prof_detect = prof_show = 0.0;
+                landmarker->palm_ms = landmarker->landmark_ms = 0.0;
+                prof_n = 0;
+            };
+
             const bool alive =
                 status.has_value() &&
                 (now - status_time < REPLY_TIMEOUT);
@@ -1377,7 +1518,12 @@ int main(int argc, char** argv)
             }
 
             if (args.no_preview)
+            {
+                report(0.0);
                 continue;
+            }
+
+            const double t_show = monotonic_seconds();
 
             std::vector<std::string> lines;
 
@@ -1430,6 +1576,8 @@ int main(int argc, char** argv)
             gui::show(WINDOW_NAME, preview);
 
             const int key = gui::wait_key(1) & 0xFF;
+
+            report((monotonic_seconds() - t_show) * 1e3);
 
             if (key == 'q' || key == 27)
                 break;
