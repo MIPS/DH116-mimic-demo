@@ -8,7 +8,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}") 
 set(PROJECT_INCLUDE_DIR "${PROJECT_ROOT}/include") 
-set(PROJECT_MODEL_DIR "${PROJECT_ROOT}/models")
 
 # SOEM
 set(SOEM_DIR "${PROJECT_ROOT}/third_party/SOEM" CACHE PATH "Path to SOEM source tree")
@@ -23,7 +22,6 @@ endif()
 # Optional C++ camera + ONNX Runtime frontend
 option(BUILD_HAND_CAM "Build the camera frontend (requires OpenCV and ONNX Runtime)" OFF)
 option(HAND_CAM_HEADLESS "Build the camera frontend without the GUI preview (no OpenCV highgui)" OFF)
-set(ONNXRUNTIME_DIR "${PROJECT_ROOT}/third_party/onnxruntime" CACHE PATH "Path to ONNX Runtime source tree")
 
 # C EtherCAT teleoperation controller
 add_executable(dh116_teleop src/dh116_teleop.c src/dh116_bus.c src/hand_math.c )
@@ -36,7 +34,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(BUILD_HAND_CAM)
-    set(_opencv_components core imgproc videoio imgcodecs)
+    set(_opencv_components core imgproc videoio)
     if(NOT HAND_CAM_HEADLESS)
         list(APPEND _opencv_components highgui)
     endif()
@@ -45,7 +43,7 @@ if(BUILD_HAND_CAM)
     # Override these paths if ONNX Runtime is installed in a nonstandard location.
     set(ONNXRUNTIME_ROOT "" CACHE PATH "Optional ONNX Runtime installation prefix")
     find_path(ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime_cxx_api.h
-        HINTS "${ONNXRUNTIME_ROOT}/include" "${ONNXRUNTIME_DIR}/include"
+        HINTS "${ONNXRUNTIME_ROOT}/include"
         PATH_SUFFIXES onnxruntime onnxruntime/core/session core/session
         REQUIRED
     )
@@ -73,30 +71,9 @@ if(BUILD_HAND_CAM)
     endif()
 endif()
 
-# Optional: hardware retargeting test
-option(BUILD_RETARGET_TEST "Build the hardware-dependent retargeting test" OFF )
-if(BUILD_RETARGET_TEST) 
-add_executable(retarget_test src/test/retarget_test.c src/dh116_bus.c )
-target_include_directories(retarget_test PRIVATE
-    "${PROJECT_INCLUDE_DIR}"
-)
-target_link_libraries(retarget_test PRIVATE
-    soem
-)
-target_compile_options(retarget_test PRIVATE
-    -Wall
-    -Wextra
-    -Wpedantic
-)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(retarget_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
-endif()
-endif()
-
 # Diagnostics
 message(STATUS "Project root: ${PROJECT_ROOT}")
 message(STATUS "SOEM directory: ${SOEM_DIR}")
-message(STATUS "ONNX Runtime directory: ${ONNXRUNTIME_DIR}")
 message(STATUS "Build hand camera frontend: ${BUILD_HAND_CAM}")
 if(BUILD_HAND_CAM)
     message(STATUS "Hand camera headless: ${HAND_CAM_HEADLESS}")
@@ -104,5 +81,3 @@ if(BUILD_HAND_CAM)
     message(STATUS "ONNX Runtime header: ${ONNXRUNTIME_INCLUDE_DIR}")
     message(STATUS "ONNX Runtime library: ${ONNXRUNTIME_LIBRARY}")
 endif()
-message(STATUS "Model directory: ${PROJECT_MODEL_DIR}")
-message(STATUS "Build retarget test: ${BUILD_RETARGET_TEST}")

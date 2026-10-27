@@ -174,7 +174,7 @@ check_opencv() {
     printf '%s\n' \
         'cmake_minimum_required(VERSION 3.20)' \
         'project(probe LANGUAGES CXX)' \
-        'find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui videoio imgcodecs)' \
+        'find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui videoio)' \
         >"$probe/CMakeLists.txt"
     if ! cmake -S "$probe" -B "$probe/build" >"$probe/log" 2>&1; then
         sed 's/^/    /' "$probe/log" >&2

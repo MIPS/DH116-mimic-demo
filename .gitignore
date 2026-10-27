@@ -2,8 +2,6 @@
 /build/
 /dist/
 cmake-build*/
-cmake/
-CMakePresets.json
 CMakeUserPresets.json
 
 # CMake caches and generated build-system files (including in-source builds).
@@ -36,5 +34,4 @@ compile_commands.json
 /src/dh116_move
 /dh116_teleop
 /hand_cam
-/retarget_test
 trash/

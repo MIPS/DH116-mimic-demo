@@ -17,23 +17,12 @@
 
 /* group k (0..5) in the frame belongs to this joint: thumb flex, thumb sweep, little, ring, middle, index */
 static const int DH116_GROUP_JOINT[6] = {2, 1, 6, 5, 4, 3};
-static const float DH116_RANGE_DEG[7] = {0, 60, 30, 80, 80, 80, 80};
 
 /* control word: high byte = command, low byte = mode (0x20 = position mode) */
 #define DH116_CTRL_ENABLE_PREP 0x0020  /* sent first when enabling   */
 #define DH116_CTRL_ENABLED     0x0120
 #define DH116_CTRL_DISABLED    0x0220
 #define DH116_CTRL_MOVE        0x0820  /* "take the data frame that follows" */
-#define DH116_CTRL_HOME_PREP   0x0025
-#define DH116_CTRL_HOME_START  0x0425
-
-static inline int dh116_deg_to_raw(int joint, float deg) {
-  float r = deg / DH116_RANGE_DEG[joint] * 10000.0f;
-  if (r < 0) r = 0;
-  if (r > 10000) r = 10000;
-  return (int)(r + 0.5f);
-}
-static inline float dh116_raw_to_deg(int joint, int raw) { return raw / 10000.0f * DH116_RANGE_DEG[joint]; }
 
 static inline void dh116_put16(uint8_t* b, int word, uint16_t v) { b[2 * word] = v & 0xFF; b[2 * word + 1] = v >> 8; }
 static inline uint16_t dh116_get16(const uint8_t* b, int off) { return (uint16_t)(b[off] | (b[off + 1] << 8)); }
@@ -75,14 +64,5 @@ static inline int dh116_decode_joints(const uint8_t t[DH116_TPDO_BYTES], dh116_f
     fb->cur[j] = (int16_t)dh116_get16(t, 6 + 6 * i);
   }
   return n;
-}
-
-/* TPDO tactile (byte 0 == 0x40, byte 1 = number of blocks, usually 6).
- * Blocks of 30 bytes at 2, 32, 62, 92, 122 = thumb, index, middle, ring, little tip;
- * block 5 (palm) starts at 152. Pressure bytes at block start (thumb 5, other fingers 9, palm 22):
- * finger pressure = byte/255. Only checked against the library, not a real hand. */
-static inline int dh116_tactile_offset(int sensor_block) { return sensor_block < 5 ? 2 + 30 * sensor_block : 152; }
-static inline float dh116_tactile_pressure(const uint8_t t[DH116_TPDO_BYTES], int sensor_block, int idx) {
-  return t[dh116_tactile_offset(sensor_block) + idx] / 255.0f;
 }
 #endif

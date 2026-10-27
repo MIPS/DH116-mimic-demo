@@ -138,7 +138,7 @@ CAMERA_CMD=(
     "$CAMERA_APP"
     --camera "$CAMERA"
     --port "$PORT"
-    --model "$ROOT_DIR/models/hand_landmarker.task"
+    --model-dir "$ROOT_DIR/models"
     --width 640
     --height 480
     --threads 4

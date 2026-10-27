@@ -4,7 +4,7 @@
  *   sudo ./build/dh116_teleop <ifname> [options]     drive the hand
  *        ./build/dh116_teleop --dry-run [options]    same pipeline, no EtherCAT (for the GUI / tests)
  *
- * hand_cam.py sends MediaPipe world landmarks (teleop_proto.h) to 127.0.0.1:<port>. This program
+ * hand_cam sends hand world landmarks (teleop_proto.h) to 127.0.0.1:<port>. This program
  * turns them into closures (hand_math.c), maps closure 0..1 to raw 0..10000 per joint and streams
  * them to the hand: a data frame with the new targets, then one MOVE control frame, then data
  * frames again, repeated whenever a target moves past --deadband.

@@ -245,7 +245,7 @@ build_opencv() {
         -DCMAKE_C_FLAGS=-DCV_RVV_SCALABLE \
         -DCMAKE_CXX_FLAGS=-DCV_RVV_SCALABLE \
         -DBUILD_SHARED_LIBS=OFF \
-        -DBUILD_LIST=core,imgproc,imgcodecs,videoio \
+        -DBUILD_LIST=core,imgproc,videoio \
         -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_DOCS=OFF \
         -DBUILD_opencv_apps=OFF -DBUILD_JAVA=OFF -DBUILD_opencv_python3=OFF \
         -DBUILD_ZLIB=ON -DBUILD_PNG=ON -DBUILD_JPEG=ON -DWITH_PNG=ON -DWITH_JPEG=ON \
@@ -371,7 +371,6 @@ make_bundle() {
 
     cp "$REPO_ROOT/hand_calibration.json" "$SCRIPT_DIR/run.sh" "$BUNDLE/"
     if ((! CONTROLLER_ONLY)); then
-        # hand_cam only takes the directory of --model, so the .task file is not shipped.
         cp "$REPO_ROOT"/models/hand_palm.onnx "$REPO_ROOT"/models/hand_landmark_detector.onnx "$BUNDLE/models/"
     fi
 
@@ -427,7 +426,7 @@ smoke_test() {
     local controller=$!
     status=0
     timeout -s KILL 900 "$QEMU" -cpu "$cpu" "$BUNDLE/bin/hand_cam" --camera "$clip" --no-preview \
-        --frames 3 --threads 2 --port "$port" --model "$BUNDLE/models/hand_landmarker.task" \
+        --frames 3 --threads 2 --port "$port" --model-dir "$BUNDLE/models" \
         >"$LOGS/test-camera.log" 2>&1 || status=$?
     kill "$controller" 2>/dev/null || true
     wait "$controller" 2>/dev/null || true

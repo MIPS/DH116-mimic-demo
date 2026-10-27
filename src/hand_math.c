@@ -1,5 +1,4 @@
-/* hand_math.c - see hand_math.h. Mirrors hand_tracker.py function by function so
- * test/parity_check.py can compare both on the same landmarks. */
+/* hand_math.c - see hand_math.h. */
 #include "hand_math.h"
 
 #include <math.h>
@@ -80,33 +79,20 @@ int hm_features(const float pts[21][3], int mirror, double out[HM_N])
 
 void hm_calib_default(hm_calib *c)
 {
-   static const double neutral[9] = {0, 1, 0, 0, 0, -1, -1, 0, 0};
    int i;
    c->open[0] = -0.9; c->closed[0] = 0.6;
    c->open[1] = RAD(15); c->closed[1] = RAD(70);
    for (i = 2; i < HM_N; ++i) { c->open[i] = RAD(30); c->closed[i] = RAD(200); }
-   memcpy(c->neutral, neutral, sizeof(neutral));
 }
 
 int hm_calib_validate(const hm_calib *c, char *err, size_t n)
 {
    static const double min_span[HM_N] = {0.3, RAD(15), RAD(45), RAD(45), RAD(45), RAD(45)};
-   const double *m = c->neutral;
-   int i, r, k;
+   int i;
    for (i = 0; i < HM_N; ++i)
       if (!isfinite(c->open[i]) || !isfinite(c->closed[i])) { snprintf(err, n, "values must be finite"); return -1; }
-   for (i = 0; i < 9; ++i)
-      if (!isfinite(m[i])) { snprintf(err, n, "values must be finite"); return -1; }
    for (i = 0; i < HM_N; ++i)
       if (c->closed[i] - c->open[i] < min_span[i]) { snprintf(err, n, "%s: fist not more closed than open", LABELS[i]); return -1; }
-   for (r = 0; r < 3; ++r)
-      for (k = 0; k < 3; ++k)
-      {
-         double s = m[r] * m[k] + m[3 + r] * m[3 + k] + m[6 + r] * m[6 + k]; /* (N^T N)[r][k] */
-         if (fabs(s - (r == k)) > 1e-4 + 1e-5 * (r == k)) { snprintf(err, n, "neutral is not a rotation"); return -1; }
-      }
-   if (m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]) < 0)
-   { snprintf(err, n, "neutral is not a rotation"); return -1; }
    return 0;
 }
 
@@ -142,8 +128,7 @@ int hm_calib_load(hm_calib *c, const char *path, char *err, size_t n)
    fclose(f);
    buf[len] = 0;
    if (!strstr(buf, "\"dh116-hand-teleop\"") || json_numbers(buf, "version", &version, 1) || version != 1.0 ||
-       json_numbers(buf, "open", c->open, HM_N) || json_numbers(buf, "closed", c->closed, HM_N) ||
-       json_numbers(buf, "neutral_rotation", c->neutral, 9))
+       json_numbers(buf, "open", c->open, HM_N) || json_numbers(buf, "closed", c->closed, HM_N))
    {
       snprintf(err, n, "%s is not a version 1 dh116-hand-teleop calibration", path);
       return -1;
@@ -165,9 +150,6 @@ int hm_calib_save(const hm_calib *c, const char *path)
    for (i = 0; i < HM_N; ++i) fprintf(f, "%s%.17g", i ? ", " : "", c->open[i]);
    fprintf(f, "],\n  \"closed\": [");
    for (i = 0; i < HM_N; ++i) fprintf(f, "%s%.17g", i ? ", " : "", c->closed[i]);
-   fprintf(f, "],\n  \"neutral_rotation\": [");
-   for (i = 0; i < 3; ++i)
-      fprintf(f, "%s[%.17g, %.17g, %.17g]", i ? ", " : "", c->neutral[3 * i], c->neutral[3 * i + 1], c->neutral[3 * i + 2]);
    fprintf(f, "]\n}\n");
    if (fclose(f) != 0) return -1;
    if (uid && gid && chown(tmp, (uid_t)atoi(uid), (gid_t)atoi(gid))) { /* best effort when run with sudo */ }

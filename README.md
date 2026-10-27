@@ -63,7 +63,7 @@ Add `-DBUILD_HAND_CAM=ON -DONNXRUNTIME_ROOT=/path/to/onnxruntime` for the camera
 What the script does:
 
 1. Uses `riscv64-linux-gnu-gcc` from `PATH` (GCC 14 or newer). On Debian and Ubuntu hosts without one, it downloads the cross-compiler packages with `apt-get download` and unpacks them into `build/toolchain/riscv64/`; no root is needed. Elsewhere, install a riscv64 cross GCC yourself.
-2. Builds OpenCV 4.10.0 as static libraries: core, imgproc, imgcodecs, and videoio with V4L2 capture; no GUI, FFmpeg, or GStreamer. Video files must be MJPEG AVI.
+2. Builds OpenCV 4.10.0 as static libraries: core, imgproc, and videoio with V4L2 capture; no GUI, FFmpeg, or GStreamer. Video files must be MJPEG AVI.
 3. Builds ONNX Runtime from the submodule with `--rv64 --enable_rvv` (RVV matrix-multiply, convolution, and softmax kernels) and merges its static libraries into one `libonnxruntime.a`.
 4. Builds `dh116_teleop` and `hand_cam` with [cmake/toolchains/riscv64-rva23-static.cmake](cmake/toolchains/riscv64-rva23-static.cmake), `-DHAND_CAM_HEADLESS=ON`, and static linking, then checks that both are static RISC-V ELF files.
 5. Packs `bin/`, `models/`, `hand_calibration.json`, and `run.sh` into the tarball.
@@ -111,12 +111,14 @@ To start the programs by hand instead:
 
 ```bash
 ./bin/dh116_teleop --dry-run --calibration hand_calibration.json &
-./bin/hand_cam --camera 0 --model models/hand_landmarker.task --width 640 --height 480 --threads 4
+./bin/hand_cam --camera 0 --model-dir models --width 640 --height 480 --threads 4
 
 sudo ./bin/dh116_teleop eth1 --calibration hand_calibration.json      # hardware; instead of --dry-run
 ```
 
-`--model` only selects the directory that holds `hand_palm.onnx` and `hand_landmark_detector.onnx`; the `.task` file is not shipped. Lower `--width`, `--height`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
+`--model-dir` is the directory that holds `hand_palm.onnx` and `hand_landmark_detector.onnx` (default `models`). Lower `--width`, `--height`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
+
+To estimate inference time on any device before building anything, run `python3 scripts/bench_models.py` (needs only `pip install onnxruntime numpy`). It times both networks for several thread counts and prints the expected per-frame model cost; `--threads 1,2,4,8` sweeps counts and `taskset -c ...` pins it to chosen cores.
 
 
 
@@ -139,7 +141,7 @@ sudo ./bin/dh116_teleop eth1 --calibration hand_calibration.json      # hardware
 | [third_party/SOEM/](third_party/SOEM/) | EtherCAT master submodule. |
 | [third_party/onnxruntime/](third_party/onnxruntime/) | ONNX Runtime source submodule; built by `build.sh`. |
 
-The top-level CMake project builds `dh116_teleop`, `hand_cam` (optional), and `retarget_test` (optional).
+The top-level CMake project builds `dh116_teleop`, and `hand_cam` (optional).
 
 
 ## Requirements

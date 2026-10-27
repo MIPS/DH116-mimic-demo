@@ -1,0 +1,35 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "native",
+      "displayName": "Host build",
+      "binaryDir": "${sourceDir}/build/native",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_HAND_CAM": "ON",
+        "ONNXRUNTIME_ROOT": "${sourceDir}/build/prefix/native"
+      }
+    },
+    {
+      "name": "riscv64",
+      "displayName": "riscv64 RVA23 static (headless)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/riscv64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/riscv64-rva23-static.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_FIND_ROOT_PATH": "${sourceDir}/build/prefix/riscv64",
+        "BUILD_HAND_CAM": "ON",
+        "HAND_CAM_HEADLESS": "ON",
+        "ONNXRUNTIME_ROOT": "${sourceDir}/build/prefix/riscv64",
+        "OpenCV_DIR": "${sourceDir}/build/prefix/riscv64/lib/cmake/opencv4"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "native", "configurePreset": "native" },
+    { "name": "riscv64", "configurePreset": "riscv64" }
+  ]
+}

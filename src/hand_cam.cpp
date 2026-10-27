@@ -1,18 +1,11 @@
 // hand_cam.cpp
 //
-// Native C++ replacement for the Python ONNX hand-tracking front end.
+// Camera + hand-landmark front end: webcam -> palm detector -> landmark network (ONNX Runtime)
+// -> 21 world landmarks sent over UDP to dh116_teleop (layouts in teleop_proto.h).
+// The controller's reply is drawn in the preview window.
 //
-// Dependencies:
-//   - OpenCV: core, imgproc, imgcodecs, videoio, highgui (not needed with HAND_CAM_HEADLESS)
-//   - ONNX Runtime C++
-//   - Linux/POSIX UDP sockets
-//
-// The UDP wire format is compatible with teleop_proto.h and the
-// Python struct formats:
-//   LANDMARKS = "<IHBBIB3xd63f4x"  (280 bytes)
-//   STATUS    = "<IHBBI6f6h6hB3x64s" (128 bytes)
-//
-// Build configuration is provided after the source.
+// Dependencies: OpenCV (core, imgproc, videoio, highgui; no highgui with HAND_CAM_HEADLESS),
+// ONNX Runtime C++, Linux UDP sockets.
 
 #include <onnxruntime_cxx_api.h>
 
@@ -46,23 +39,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// -----------------------------------------------------------------------------
-// Protocol constants: keep synchronized with teleop_proto.h.
-// -----------------------------------------------------------------------------
-
-constexpr uint16_t DEFAULT_PORT = 5006;
-constexpr uint16_t VERSION = 1;
-
-constexpr uint32_t MAGIC_LANDMARKS = 0x4D4C4844;
-constexpr uint32_t MAGIC_STATUS    = 0x54534844;
-
-constexpr uint8_t FLAG_DETECTED = 0x01;
-constexpr uint8_t FLAG_QUIT     = 0x02;
-
-constexpr uint8_t CAL_NONE  = 0;
-constexpr uint8_t CAL_OPEN  = 1;
-constexpr uint8_t CAL_FIST  = 2;
-constexpr uint8_t CAL_RESET = 3;
+#include "teleop_proto.h"
 
 constexpr double REPLY_TIMEOUT = 0.5;
 
@@ -125,216 +102,33 @@ double monotonic_seconds()
         clock::now().time_since_epoch()).count();
 }
 
-uint64_t monotonic_milliseconds()
-{
-    return static_cast<uint64_t>(monotonic_seconds() * 1000.0);
-}
-
 
 // -----------------------------------------------------------------------------
-// Explicit little-endian packet serialization.
-//
-// Do not send a native C++ struct directly. Native structure padding and
-// alignment must not change the established Python/C wire protocol.
+// Packets
 // -----------------------------------------------------------------------------
 
-constexpr size_t LANDMARK_PACKET_SIZE = 280;
-constexpr size_t STATUS_PACKET_SIZE   = 128;
-
-using LandmarkPacket = std::array<uint8_t, LANDMARK_PACKET_SIZE>;
-using StatusPacket   = std::array<uint8_t, STATUS_PACKET_SIZE>;
-
-void put_u16_le(uint8_t* dst, uint16_t value)
-{
-    dst[0] = static_cast<uint8_t>(value);
-    dst[1] = static_cast<uint8_t>(value >> 8);
-}
-
-void put_u32_le(uint8_t* dst, uint32_t value)
-{
-    for (int i = 0; i < 4; ++i)
-        dst[i] = static_cast<uint8_t>(value >> (8 * i));
-}
-
-void put_u64_le(uint8_t* dst, uint64_t value)
-{
-    for (int i = 0; i < 8; ++i)
-        dst[i] = static_cast<uint8_t>(value >> (8 * i));
-}
-
-uint16_t get_u16_le(const uint8_t* src)
-{
-    return static_cast<uint16_t>(src[0]) |
-           (static_cast<uint16_t>(src[1]) << 8);
-}
-
-uint32_t get_u32_le(const uint8_t* src)
-{
-    uint32_t result = 0;
-    for (int i = 0; i < 4; ++i)
-        result |= static_cast<uint32_t>(src[i]) << (8 * i);
-    return result;
-}
-
-uint64_t get_u64_le(const uint8_t* src)
-{
-    uint64_t result = 0;
-    for (int i = 0; i < 8; ++i)
-        result |= static_cast<uint64_t>(src[i]) << (8 * i);
-    return result;
-}
-
-void put_float_le(uint8_t* dst, float value)
-{
-    uint32_t bits;
-    static_assert(sizeof(float) == sizeof(uint32_t));
-    std::memcpy(&bits, &value, sizeof(bits));
-    put_u32_le(dst, bits);
-}
-
-float get_float_le(const uint8_t* src)
-{
-    uint32_t bits = get_u32_le(src);
-    float value;
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-void put_double_le(uint8_t* dst, double value)
-{
-    uint64_t bits;
-    static_assert(sizeof(double) == sizeof(uint64_t));
-    std::memcpy(&bits, &value, sizeof(bits));
-    put_u64_le(dst, bits);
-}
-
-double get_double_le(const uint8_t* src)
-{
-    uint64_t bits = get_u64_le(src);
-    double value;
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-void put_i16_le(uint8_t* dst, int16_t value)
-{
-    uint16_t bits;
-    std::memcpy(&bits, &value, sizeof(bits));
-    put_u16_le(dst, bits);
-}
-
-int16_t get_i16_le(const uint8_t* src)
-{
-    uint16_t bits = get_u16_le(src);
-    int16_t value;
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-LandmarkPacket encode_packet(
+tp_landmarks make_packet(
     uint32_t seq,
     double time_s,
     bool right,
-    const std::optional<std::array<float, 63>>& world,
+    const std::array<float, 63>* world,
     uint8_t calibration,
     bool quit)
 {
-    LandmarkPacket packet{};
+    tp_landmarks packet{};
 
-    uint8_t flags = 0;
+    packet.magic = TP_MAGIC_LANDMARKS;
+    packet.version = TP_VERSION;
+    packet.flags = (world ? TP_FLAG_DETECTED : 0) | (quit ? TP_FLAG_QUIT : 0);
+    packet.cal_cmd = calibration;
+    packet.seq = seq;
+    packet.right_hand = right ? 1 : 0;
+    packet.time_s = time_s;
 
-    if (world.has_value())
-        flags |= FLAG_DETECTED;
-
-    if (quit)
-        flags |= FLAG_QUIT;
-
-    // "<IHBBIB3xd63f4x"
-    //
-    // Offset  Size  Field
-    // 0       4     magic
-    // 4       2     version
-    // 6       1     flags
-    // 7       1     calibration
-    // 8       4     sequence
-    // 12      1     selected hand is right
-    // 13      3     padding
-    // 16      8     monotonic timestamp in seconds
-    // 24      252   63 float coordinates
-    // 276     4     trailing padding
-
-    put_u32_le(packet.data() + 0, MAGIC_LANDMARKS);
-    put_u16_le(packet.data() + 4, VERSION);
-
-    packet[6] = flags;
-    packet[7] = calibration;
-
-    put_u32_le(packet.data() + 8, seq);
-    packet[12] = right ? 1 : 0;
-
-    put_double_le(packet.data() + 16, time_s);
-
-    if (world.has_value())
-    {
-        for (size_t i = 0; i < 63; ++i)
-            put_float_le(packet.data() + 24 + i * 4, (*world)[i]);
-    }
+    if (world)
+        std::memcpy(packet.world, world->data(), sizeof(packet.world));
 
     return packet;
-}
-
-struct Status
-{
-    uint8_t state = 0;
-    uint8_t valid = 0;
-    uint32_t seq = 0;
-
-    std::array<float, 6> closure{};
-    std::array<int16_t, 6> target{};
-    std::array<int16_t, 6> measured{};
-
-    uint8_t have_fb = 0;
-    std::string message;
-};
-
-std::optional<Status> decode_status(
-    const uint8_t* packet,
-    size_t length)
-{
-    if (length != STATUS_PACKET_SIZE)
-        return std::nullopt;
-
-    if (get_u32_le(packet + 0) != MAGIC_STATUS ||
-        get_u16_le(packet + 4) != VERSION)
-        return std::nullopt;
-
-    Status result;
-
-    // "<IHBBI6f6h6hB3x64s"
-    result.state = packet[6];
-    result.valid = packet[7];
-    result.seq = get_u32_le(packet + 8);
-
-    for (size_t i = 0; i < 6; ++i)
-        result.closure[i] = get_float_le(packet + 12 + i * 4);
-
-    for (size_t i = 0; i < 6; ++i)
-        result.target[i] = get_i16_le(packet + 36 + i * 2);
-
-    for (size_t i = 0; i < 6; ++i)
-        result.measured[i] = get_i16_le(packet + 48 + i * 2);
-
-    result.have_fb = packet[60];
-
-    const char* msg = reinterpret_cast<const char*>(packet + 64);
-    size_t msg_len = 0;
-
-    while (msg_len < 64 && msg[msg_len] != '\0')
-        ++msg_len;
-
-    result.message.assign(msg, msg_len);
-
-    return result;
 }
 
 // -----------------------------------------------------------------------------
@@ -347,11 +141,10 @@ struct Options
     int width = 320;
     int height = 240;
     std::string hand = "left";
-    int port = DEFAULT_PORT;
+    int port = TP_PORT;
 
-    // The model option is used to derive the two ONNX paths from its directory.
-    // This default assumes the application is launched from the project root.
-    std::string model = "models/hand_landmarker.task";
+    // Holds hand_palm.onnx and hand_landmark_detector.onnx.
+    std::string model_dir = "models";
 
     bool flip_input = false;
     bool no_preview = false;
@@ -371,7 +164,7 @@ void print_usage(const char* argv0)
         << "  --height N            Camera height (default 240)\n"
         << "  --hand left|right     Hand to track (default left)\n"
         << "  --port N              Controller UDP port (default 5006)\n"
-        << "  --model PATH          Path used to derive ONNX model paths\n"
+        << "  --model-dir DIR       Directory with the two ONNX models (default models)\n"
         << "  --flip-input          Horizontally flip incoming frames\n"
         << "  --no-preview          Disable the GUI\n"
         << "  --frames N            Stop after N frames; 0 means unlimited\n"
@@ -411,8 +204,8 @@ Options parse_args(int argc, char** argv)
             opts.hand = value(i, arg);
         else if (arg == "--port")
             opts.port = std::stoi(value(i, arg));
-        else if (arg == "--model")
-            opts.model = value(i, arg);
+        else if (arg == "--model-dir")
+            opts.model_dir = value(i, arg);
         else if (arg == "--flip-input")
             opts.flip_input = true;
         else if (arg == "--no-preview")
@@ -604,13 +397,6 @@ private:
 // Hand landmark data
 // -----------------------------------------------------------------------------
 
-struct Landmark
-{
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-};
-
 struct ROI
 {
     double cx = 0.0;
@@ -621,16 +407,11 @@ struct ROI
 
 struct DetectedHand
 {
-    std::array<Landmark, 21> screen;
-    std::array<Landmark, 21> world;
+    std::array<cv::Point2f, 21> screen;  // normalised image coordinates
+    std::array<float, 63> world;         // metres, wrist-centred, xyz per point
 
-    std::string side;
+    bool right = false;
     float handedness_score = 0.0f;
-};
-
-struct DetectionResult
-{
-    std::vector<DetectedHand> hands;
 };
 
 // -----------------------------------------------------------------------------
@@ -681,19 +462,10 @@ public:
 
         palm_output_names_ = get_output_names(palm_);
         landmark_output_names_ = get_output_names(landmark_);
-
-        auto lm_info = landmark_.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-        const auto lm_shape = lm_info.GetShape();
-
-        landmark_nchw_ =
-            lm_shape.size() == 4 && lm_shape[1] == 3;
-
-        has_world_ = landmark_output_names_.size() >= 4;
-
-        padded_ = cv::Mat::zeros(PALM_SIZE, PALM_SIZE, CV_8UC3);
     }
 
-    DetectionResult detect(const cv::Mat& rgb)
+    // want_right: once that hand is found, only it is tracked (saves a landmark pass per frame).
+    std::vector<DetectedHand> detect(const cv::Mat& rgb, bool want_right)
     {
         if (rgb.empty() || rgb.type() != CV_8UC3)
             throw std::runtime_error("Expected a nonempty RGB uint8 image");
@@ -723,8 +495,9 @@ public:
                 palm_outputs.at(0), pad_x, pad_y, scale);
         }
 
-        DetectionResult result;
+        std::vector<DetectedHand> result;
         std::vector<ROI> next_tracked;
+        std::vector<ROI> wanted_tracked;
 
         for (const ROI& roi : tracked_)
         {
@@ -733,16 +506,16 @@ public:
 
             const auto lm_outputs = run_model(
                 landmark_, landmark_input_name_,
-                landmark_output_names_, crop, landmark_nchw_);
+                landmark_output_names_, crop, false);
 
-            if (lm_outputs.size() < 3)
+            if (lm_outputs.size() < 4 ||
+                lm_outputs[0].values.size() < 63 ||
+                lm_outputs[1].values.empty() ||
+                lm_outputs[2].values.empty() ||
+                lm_outputs[3].values.size() < 63)
                 throw std::runtime_error(
-                    "Landmark model must return screen landmarks, "
-                    "presence, and handedness");
-
-            if (lm_outputs[1].values.empty() ||
-                lm_outputs[2].values.empty())
-                throw std::runtime_error("Empty landmark model output");
+                    "Landmark model must return 63 screen values, presence, "
+                    "handedness and 63 world values");
 
             if (lm_outputs[1].values[0] < threshold_)
                 continue;
@@ -750,15 +523,11 @@ public:
             const float raw_hand = lm_outputs[2].values[0];
 
             DetectedHand hand;
-            hand.side = raw_hand > 0.5f ? "Right" : "Left";
+            hand.right = raw_hand > 0.5f;
             hand.handedness_score =
                 raw_hand > 0.5f ? raw_hand : 1.0f - raw_hand;
 
             const auto& pts = lm_outputs[0].values;
-
-            if (pts.size() < 63)
-                throw std::runtime_error(
-                    "Screen landmark output has fewer than 63 values");
 
             cv::Mat inverse;
             cv::invertAffineTransform(affine, inverse);
@@ -782,42 +551,20 @@ public:
 
                 hand.screen[i] = {
                     xy_orig[i].x / static_cast<float>(w),
-                    xy_orig[i].y / static_cast<float>(h),
-                    pts[i * 3 + 2] / static_cast<float>(LM_SIZE)
+                    xy_orig[i].y / static_cast<float>(h)
                 };
             }
 
-            if (has_world_ && lm_outputs.size() >= 4 &&
-                lm_outputs[3].values.size() >= 63)
-            {
-                const auto& world = lm_outputs[3].values;
+            std::copy_n(lm_outputs[3].values.begin(), 63, hand.world.begin());
 
-                for (int i = 0; i < 21; ++i)
-                {
-                    hand.world[i] = {
-                        world[i * 3 + 0],
-                        world[i * 3 + 1],
-                        world[i * 3 + 2]
-                    };
-                }
-            }
-            else
-            {
-                for (int i = 0; i < 21; ++i)
-                {
-                    hand.world[i] = {
-                        hand.screen[i].x - hand.screen[0].x,
-                        hand.screen[i].y - hand.screen[0].y,
-                        0.0f
-                    };
-                }
-            }
-
-            result.hands.push_back(hand);
+            result.push_back(hand);
             next_tracked.push_back(roi_from_landmarks(xy_orig));
+
+            if (hand.right == want_right)
+                wanted_tracked.push_back(next_tracked.back());
         }
 
-        tracked_ = next_tracked;
+        tracked_ = wanted_tracked.empty() ? next_tracked : wanted_tracked;
 
         return result;
     }
@@ -862,47 +609,33 @@ private:
         return result;
     }
 
-    static std::vector<float> to_chw_float(const cv::Mat& rgb)
+    // Converts to float in [0,1] into the reused input_ buffer. NHWC is one convertTo;
+    // NCHW converts and then splits the channels straight into input_.
+    void fill_input(const cv::Mat& rgb, bool nchw)
     {
-        std::vector<float> values(
-            static_cast<size_t>(rgb.rows) * rgb.cols * 3);
+        const int rows = rgb.rows;
+        const int cols = rgb.cols;
 
-        size_t index = 0;
+        input_.resize(static_cast<size_t>(rows) * cols * 3);
 
-        for (int c = 0; c < 3; ++c)
+        constexpr double inv255 = 1.0 / 255.0;
+
+        if (!nchw)
         {
-            for (int y = 0; y < rgb.rows; ++y)
-            {
-                const auto* row = rgb.ptr<cv::Vec3b>(y);
-
-                for (int x = 0; x < rgb.cols; ++x)
-                    values[index++] = row[x][c] / 255.0f;
-            }
+            cv::Mat dst(rows, cols, CV_32FC3, input_.data());
+            rgb.convertTo(dst, CV_32FC3, inv255);
+            return;
         }
 
-        return values;
-    }
+        rgb.convertTo(scratch_, CV_32FC3, inv255);
 
-    static std::vector<float> to_hwc_float(const cv::Mat& rgb)
-    {
-        std::vector<float> values(
-            static_cast<size_t>(rgb.rows) * rgb.cols * 3);
+        const size_t plane = static_cast<size_t>(rows) * cols;
+        cv::Mat planes[3] = {
+            cv::Mat(rows, cols, CV_32F, input_.data()),
+            cv::Mat(rows, cols, CV_32F, input_.data() + plane),
+            cv::Mat(rows, cols, CV_32F, input_.data() + 2 * plane)};
 
-        size_t index = 0;
-
-        for (int y = 0; y < rgb.rows; ++y)
-        {
-            const auto* row = rgb.ptr<cv::Vec3b>(y);
-
-            for (int x = 0; x < rgb.cols; ++x)
-            {
-                values[index++] = row[x][0] / 255.0f;
-                values[index++] = row[x][1] / 255.0f;
-                values[index++] = row[x][2] / 255.0f;
-            }
-        }
-
-        return values;
+        cv::split(scratch_, planes);
     }
 
     static cv::Mat make_palm_input(
@@ -941,8 +674,8 @@ private:
         const cv::Mat& rgb,
         bool nchw)
     {
-        std::vector<float> input_values =
-            nchw ? to_chw_float(rgb) : to_hwc_float(rgb);
+        fill_input(rgb, nchw);
+        std::vector<float>& input_values = input_;
 
         std::vector<int64_t> shape;
 
@@ -1189,13 +922,11 @@ private:
     int num_hands_ = 2;
     float threshold_ = 0.5f;
 
-    bool landmark_nchw_ = false;
-    bool has_world_ = true;
-
+    std::vector<float> input_;  // reused model input buffer
+    cv::Mat scratch_;           // reused float image for the NCHW path
     int det_every_ = 15;
     uint64_t det_counter_ = 0;
 
-    cv::Mat padded_;
     std::vector<ROI> tracked_;
 };
 
@@ -1239,12 +970,12 @@ public:
         close();
     }
 
-    void send(const LandmarkPacket& packet)
+    void send(const tp_landmarks& packet)
     {
         const ssize_t sent = sendto(
             fd_,
-            packet.data(),
-            packet.size(),
+            &packet,
+            sizeof(packet),
             0,
             reinterpret_cast<const sockaddr*>(&target_),
             sizeof(target_));
@@ -1253,36 +984,35 @@ public:
             throw std::runtime_error(
                 std::string("UDP send failed: ") + std::strerror(errno));
 
-        if (static_cast<size_t>(sent) != packet.size())
+        if (static_cast<size_t>(sent) != sizeof(packet))
             throw std::runtime_error("UDP packet was not sent completely");
     }
 
-    std::vector<Status> receive_all()
+    std::vector<tp_status> receive_all()
     {
-        std::vector<Status> results;
-        uint8_t buffer[512];
+        std::vector<tp_status> results;
+        tp_status buffer;
 
         while (true)
         {
             const ssize_t received = recvfrom(
-                fd_, buffer, sizeof(buffer), 0, nullptr, nullptr);
+                fd_, &buffer, sizeof(buffer), 0, nullptr, nullptr);
 
             if (received < 0)
             {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    break;
-
                 if (errno == EINTR)
                     continue;
 
                 break;
             }
 
-            auto status = decode_status(
-                buffer, static_cast<size_t>(received));
-
-            if (status.has_value())
-                results.push_back(*status);
+            if (static_cast<size_t>(received) == sizeof(buffer) &&
+                buffer.magic == TP_MAGIC_STATUS &&
+                buffer.version == TP_VERSION)
+            {
+                buffer.msg[sizeof(buffer.msg) - 1] = '\0';
+                results.push_back(buffer);
+            }
         }
 
         return results;
@@ -1310,7 +1040,7 @@ cv::Mat draw_preview(
     cv::Mat image,
     const std::vector<DetectedHand>& hands,
     int selected,
-    const std::optional<Status>& status,
+    const std::optional<tp_status>& status,
     const std::vector<std::string>& lines)
 {
     const int height = image.rows;
@@ -1466,18 +1196,7 @@ int main(int argc, char** argv)
     args.no_preview = true;
 #endif
 
-    // Match Python:
-    // palm_onnx = args.model.parent / "hand_palm.onnx"
-    // lm_onnx   = args.model.parent / "hand_landmark_detector.onnx"
-
-    const std::string model_dir = [&]()
-    {
-        const size_t pos = args.model.find_last_of('/');
-        return pos == std::string::npos
-            ? std::string(".")
-            : args.model.substr(0, pos);
-    }();
-
+    const std::string model_dir = args.model_dir;
     const std::string palm_path =
         model_dir + "/hand_palm.onnx";
 
@@ -1506,7 +1225,7 @@ int main(int argc, char** argv)
         landmarker = std::make_unique<HandLandmarker>(
             palm_path,
             landmark_path,
-            1,
+            2,
             0.5f,
             args.threads,
             args.det_every);
@@ -1541,12 +1260,12 @@ int main(int argc, char** argv)
 
     uint64_t count = 0;
 
-    uint8_t cal = CAL_NONE;
+    uint8_t cal = TP_CAL_NONE;
 
     double fps = 0.0;
     double previous = monotonic_seconds();
 
-    std::optional<Status> status;
+    std::optional<tp_status> status;
     double status_time = 0.0;
 
     std::string message;
@@ -1592,69 +1311,36 @@ int main(int argc, char** argv)
             cv::Mat rgb;
             cv::cvtColor(image, rgb, cv::COLOR_BGR2RGB);
 
-            DetectionResult result = landmarker->detect(rgb);
+            const std::vector<DetectedHand> hands =
+                landmarker->detect(rgb, right);
 
             int selected = -1;
             float selected_score = -1.0f;
 
-            for (size_t i = 0; i < result.hands.size(); ++i)
+            for (size_t i = 0; i < hands.size(); ++i)
             {
-                const auto& hand = result.hands[i];
-
-                std::string side = hand.side;
-
-                std::transform(
-                    side.begin(),
-                    side.end(),
-                    side.begin(),
-                    [](unsigned char c)
-                    {
-                        return static_cast<char>(std::tolower(c));
-                    });
-
-                if (side == args.hand &&
-                    hand.handedness_score >= selected_score)
+                if (hands[i].right == right &&
+                    hands[i].handedness_score >= selected_score)
                 {
                     selected = static_cast<int>(i);
-                    selected_score = hand.handedness_score;
+                    selected_score = hands[i].handedness_score;
                 }
             }
 
-            std::optional<std::array<float, 63>> world;
-
-            if (selected >= 0)
-            {
-                std::array<float, 63> coordinates{};
-
-                const auto& landmarks =
-                    result.hands[selected].world;
-
-                for (size_t i = 0; i < 21; ++i)
-                {
-                    coordinates[i * 3 + 0] = landmarks[i].x;
-                    coordinates[i * 3 + 1] = landmarks[i].y;
-                    coordinates[i * 3 + 2] = landmarks[i].z;
-                }
-
-                world = coordinates;
-            }
+            const std::array<float, 63>* world =
+                selected >= 0 ? &hands[selected].world : nullptr;
 
             try
             {
-                sock->send(encode_packet(
-                    seq,
-                    stamp,
-                    right,
-                    world,
-                    cal,
-                    false));
+                sock->send(make_packet(
+                    seq, stamp, right, world, cal, false));
             }
             catch (const std::exception& e)
             {
                 message = std::string("Send failed: ") + e.what();
             }
 
-            cal = CAL_NONE;
+            cal = TP_CAL_NONE;
 
             // Non-blocking receive: consume all queued replies.
             for (const auto& reply : sock->receive_all())
@@ -1684,9 +1370,9 @@ int main(int argc, char** argv)
                 status.has_value() &&
                 (now - status_time < REPLY_TIMEOUT);
 
-            if (alive && status->message != message)
+            if (alive && message != status->msg)
             {
-                message = status->message;
+                message = status->msg;
                 std::cout << message << std::endl;
             }
 
@@ -1704,7 +1390,7 @@ int main(int argc, char** argv)
                 std::ostringstream stream;
                 stream << std::fixed << std::setprecision(1)
                        << fps << " FPS   "
-                       << (world.has_value()
+                       << (world
                            ? "Hand detected"
                            : "No " + args.hand + " hand visible");
 
@@ -1736,7 +1422,7 @@ int main(int argc, char** argv)
 
             cv::Mat preview = draw_preview(
                 image,
-                result.hands,
+                hands,
                 selected,
                 alive ? status : std::nullopt,
                 lines);
@@ -1754,19 +1440,19 @@ int main(int argc, char** argv)
             switch (key)
             {
                 case 'o':
-                    cal = CAL_OPEN;
+                    cal = TP_CAL_OPEN;
                     break;
 
                 case 'f':
-                    cal = CAL_FIST;
+                    cal = TP_CAL_FIST;
                     break;
 
                 case 'r':
-                    cal = CAL_RESET;
+                    cal = TP_CAL_RESET;
                     break;
 
                 default:
-                    cal = CAL_NONE;
+                    cal = TP_CAL_NONE;
                     break;
             }
         }
@@ -1777,18 +1463,13 @@ int main(int argc, char** argv)
         exit_code = 2;
     }
 
-    // Match Python shutdown behavior: send three quit packets over UDP.
+    // Tell the controller to open the hand and stop; repeated because UDP may drop one.
     for (int i = 0; i < 3; ++i)
     {
         try
         {
-            sock->send(encode_packet(
-                seq++,
-                monotonic_seconds(),
-                right,
-                std::nullopt,
-                CAL_NONE,
-                true));
+            sock->send(make_packet(
+                seq++, monotonic_seconds(), right, nullptr, TP_CAL_NONE, true));
         }
         catch (...)
         {

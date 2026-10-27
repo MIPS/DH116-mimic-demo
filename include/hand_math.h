@@ -1,5 +1,5 @@
-/* hand_math.h - C port of the conversion logic in DH116_demo/scripts/teleop/hand_tracker.py:
- * 21 MediaPipe world landmarks -> six features -> calibrated closure 0..1 -> One-Euro filter.
+/* hand_math.h - hand landmarks -> teleop features:
+ * 21 MediaPipe-style world landmarks -> six features -> calibrated closure 0..1 -> One-Euro filter.
  * Palm rotation is left out: the physical hand has no wrist. Pure C, no SOEM.
  * Feature/actuator order: thumb sweep, thumb bend, index, middle, ring, little.
  */
@@ -14,7 +14,6 @@
 typedef struct
 {
    double open[HM_N], closed[HM_N];
-   double neutral[9]; /* row-major; only kept so the file stays readable by the simulator */
 } hm_calib;
 
 typedef struct
