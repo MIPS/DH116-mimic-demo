@@ -1,1608 +1,740 @@
-// hand_cam.cpp
+// hand_cam.cpp - camera side of the DH116 mimic demo.
 //
-// Camera + hand-landmark front end: webcam -> palm detector -> landmark network (ONNX Runtime)
-// -> 21 world landmarks sent over UDP to dh116_teleop (layouts in teleop_proto.h).
-// The controller's reply is drawn in the preview window.
+// Per camera frame: palm detector -> hand box -> landmark net (both ONNX Runtime) -> 21 hand landmarks in
+// metres, sent over UDP to mimic_ctrl (mimic_msg.h). mimic_ctrl replies with the joint targets and the
+// measured positions, which the preview window shows. The palm detector only runs every --det-every frames,
+// or when no hand is tracked; in between, the hand box comes from the previous frame's landmarks.
 //
-// Dependencies: OpenCV (core, imgproc, videoio, highgui; no highgui with HAND_CAM_HEADLESS),
-// ONNX Runtime C++, Linux UDP sockets.
+// Builds with HAND_CAM_HEADLESS use an OpenCV without highgui (no preview window) and always run as --no-preview.
 
 #include <onnxruntime_cxx_api.h>
-
 #include <opencv2/opencv.hpp>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
-#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <iomanip>
 #include <iostream>
-#include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "teleop_proto.h"
+#include "mimic_msg.h"
 
-constexpr double REPLY_TIMEOUT = 0.5;
+constexpr int PALM_SIZE = 192;        // palm detector input, pixels
+constexpr int LM_SIZE = 224;          // landmark net input, pixels
+constexpr double ROI_SCALE = 2.9;     // hand box side = 2.9 x palm box side,
+constexpr double ROI_SHIFT = 0.5;     // moved half a palm towards the fingers
+constexpr int MAX_HANDS = 2;          // palm detections kept per frame
+constexpr float MIN_SCORE = 0.5f;     // palm detection score and hand presence needed
+constexpr double REPLY_TIMEOUT = 0.5; // seconds without a reply from mimic_ctrl before "No reply"
+constexpr int POS_MAX = 10000;        // raw joint position of a closed joint (see dh116.h)
+constexpr int PROFILE_EVERY = 30;     // frames per --profile line
+constexpr const char* WINDOW_NAME = "DH116 Mimic";
+constexpr const char* HELP = "O: open hand   F: fist   R: reset   Q/Esc: quit";
 
-constexpr int PALM_SIZE = 192;
-constexpr int LM_SIZE   = 224;
+const char* const JOINT_NAMES[6] = {"Thumb sweep", "Thumb bend", "Index", "Middle", "Ring", "Little"};
 
-constexpr double ROI_SCALE = 2.9;
-constexpr double ROI_SHIFT = 0.5;
+// Landmark pairs drawn as the hand skeleton.
+const std::pair<int, int> BONES[] = {{0, 1},  {1, 2},   {2, 3},   {3, 4},   {0, 5},   {5, 6},   {6, 7},
+                                     {7, 8},  {5, 9},   {9, 10},  {10, 11}, {11, 12}, {9, 13},  {13, 14},
+                                     {14, 15}, {15, 16}, {13, 17}, {17, 18}, {18, 19}, {19, 20}, {0, 17}};
 
-constexpr const char* WINDOW_NAME = "DH116 Teleop";
-
-// HAND_CAM_HEADLESS builds link an OpenCV without highgui and always run with --no-preview.
+// The preview window; does nothing in headless builds (which never show it).
 namespace gui
 {
 #ifdef HAND_CAM_HEADLESS
-inline void show(const char*, const cv::Mat&) {}
-inline int wait_key(int) { return -1; }
-inline bool visible(const char*) { return true; }
-inline void close_all() {}
+inline void show(const cv::Mat&) {}
+inline int wait_key() { return -1; }
+inline bool visible() { return true; }
 #else
-inline void show(const char* name, const cv::Mat& image) { cv::imshow(name, image); }
-inline int wait_key(int ms) { return cv::waitKey(ms); }
-inline bool visible(const char* name) { return cv::getWindowProperty(name, cv::WND_PROP_VISIBLE) >= 1; }
-inline void close_all() { cv::destroyAllWindows(); }
+inline void show(const cv::Mat& image) { cv::imshow(WINDOW_NAME, image); }
+inline int wait_key() { return cv::waitKey(1) & 0xFF; }
+inline bool visible() { return cv::getWindowProperty(WINDOW_NAME, cv::WND_PROP_VISIBLE) >= 1; }
 #endif
-}  // namespace gui
+} // namespace gui
 
-const std::array<std::string, 6> LABELS = {
-    "Thumb sweep", "Thumb bend", "Index",
-    "Middle", "Ring", "Little"
-};
+std::atomic<bool> g_stop{false};
+void on_signal(int) { g_stop = true; }
 
-const std::array<std::pair<int, int>, 21> CONNECTIONS = {{
-    {0,1}, {1,2}, {2,3}, {3,4},
-    {0,5}, {5,6}, {6,7}, {7,8},
-    {5,9}, {9,10}, {10,11}, {11,12},
-    {9,13}, {13,14}, {14,15}, {15,16},
-    {13,17}, {17,18}, {18,19}, {19,20},
-    {0,17}
-}};
+double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-constexpr const char* HELP =
-    "O: open hand   F: fist   R: reset   Q/Esc: quit";
-
-std::atomic<bool> g_interrupted{false};
-
-void signal_handler(int)
-{
-    g_interrupted.store(true);
-}
-
-// -----------------------------------------------------------------------------
-// Time
-// -----------------------------------------------------------------------------
-
-double monotonic_seconds()
-{
-    using clock = std::chrono::steady_clock;
-    return std::chrono::duration<double>(
-        clock::now().time_since_epoch()).count();
-}
-
-
-// -----------------------------------------------------------------------------
-// Packets
-// -----------------------------------------------------------------------------
-
-tp_landmarks make_packet(
-    uint32_t seq,
-    double time_s,
-    bool right,
-    const std::array<float, 63>* world,
-    uint8_t calibration,
-    bool quit)
-{
-    tp_landmarks packet{};
-
-    packet.magic = TP_MAGIC_LANDMARKS;
-    packet.version = TP_VERSION;
-    packet.flags = (world ? TP_FLAG_DETECTED : 0) | (quit ? TP_FLAG_QUIT : 0);
-    packet.cal_cmd = calibration;
-    packet.seq = seq;
-    packet.right_hand = right ? 1 : 0;
-    packet.time_s = time_s;
-
-    if (world)
-        std::memcpy(packet.world, world->data(), sizeof(packet.world));
-
-    return packet;
-}
-
-// -----------------------------------------------------------------------------
-// CLI
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------------------------------------
 
 struct Options
 {
-    std::string camera = "0";
-    int width = 320;
-    int height = 240;
+    std::string camera = "0"; // camera index or video file
+    int width = 320, height = 240;
     std::string hand = "left";
-    int port = TP_PORT;
-
-    // Holds hand_palm.onnx and hand_landmark_detector.onnx.
+    int port = MSG_PORT;
     std::string model_dir = "models";
-
-    bool flip_input = false;
-    bool no_preview = false;
-    bool bench = false;
-    bool profile = false;
-    int bench_iters = 100;
-
-    int frames = 0;
-    int threads = 8;
-    int det_every = 30;
+    bool flip_input = false, no_preview = false, profile = false, bench = false;
+    int frames = 0, threads = 8, det_every = 30, bench_iters = 100;
 };
 
 void print_usage(const char* argv0)
 {
-    std::cout
-        << "Usage: " << argv0 << " [options]\n\n"
-        << "Options:\n"
-        << "  --camera SOURCE       Webcam index or video file (default 0)\n"
-        << "  --width N             Camera width (default 320)\n"
-        << "  --height N            Camera height (default 240)\n"
-        << "  --hand left|right     Hand to track (default left)\n"
-        << "  --port N              Controller UDP port (default 5006)\n"
-        << "  --model-dir DIR       Directory with the two ONNX models (default models)\n"
-        << "  --flip-input          Horizontally flip incoming frames\n"
-        << "  --no-preview          Disable the GUI\n"
-        << "  --frames N            Stop after N frames; 0 means unlimited\n"
-        << "  --threads N           ONNX intra-op threads (default 8)\n"
-        << "  --det-every N         Palm detection interval (default 30)\n"
-        << "  --profile             Print average time per stage every 30 frames\n"
-        << "  --bench               Time both models on dummy input and exit (no camera needed)\n"
-        << "  --bench-iters N       Timed runs per model for --bench (default 100)\n"
-        << "  --help                Show this help\n";
+    std::cout << "Usage: " << argv0 << " [options]\n\n"
+              << "  --camera SOURCE     camera index or video file (default 0)\n"
+              << "  --width N           camera width (default 320)\n"
+              << "  --height N          camera height (default 240)\n"
+              << "  --hand left|right   hand to track (default left)\n"
+              << "  --port N            mimic_ctrl UDP port (default " << MSG_PORT << ")\n"
+              << "  --model-dir DIR     holds hand_palm.onnx and hand_landmark_detector.onnx (default models)\n"
+              << "  --flip-input        mirror the camera image first (for cameras that deliver it mirrored)\n"
+              << "  --no-preview        no preview window\n"
+              << "  --frames N          stop after N frames; 0 means unlimited\n"
+              << "  --threads N         ONNX Runtime threads per model (default 8)\n"
+              << "  --det-every N       run the palm detector every N frames (default 30)\n"
+              << "  --profile           print the average time per stage every " << PROFILE_EVERY << " frames\n"
+              << "  --bench             time both models on random input and exit (no camera needed)\n"
+              << "  --bench-iters N     timed runs per model for --bench (default 100)\n"
+              << "  --help              show this help\n";
 }
 
 Options parse_args(int argc, char** argv)
 {
-    Options opts;
-
-    auto value = [&](int& i, const std::string& option) -> std::string
-    {
-        if (i + 1 >= argc)
-            throw std::runtime_error("Missing value for " + option);
-
-        return argv[++i];
-    };
-
+    Options o;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
-
+        auto value = [&]() -> std::string
+        {
+            if (i + 1 >= argc) throw std::runtime_error("missing value for " + arg);
+            return argv[++i];
+        };
         if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
             std::exit(0);
         }
-        else if (arg == "--camera")
-            opts.camera = value(i, arg);
-        else if (arg == "--width")
-            opts.width = std::stoi(value(i, arg));
-        else if (arg == "--height")
-            opts.height = std::stoi(value(i, arg));
-        else if (arg == "--hand")
-            opts.hand = value(i, arg);
-        else if (arg == "--port")
-            opts.port = std::stoi(value(i, arg));
-        else if (arg == "--model-dir")
-            opts.model_dir = value(i, arg);
-        else if (arg == "--flip-input")
-            opts.flip_input = true;
-        else if (arg == "--bench")
-            opts.bench = true;
-        else if (arg == "--profile")
-            opts.profile = true;
-        else if (arg == "--bench-iters")
-            opts.bench_iters = std::stoi(value(i, arg));
-        else if (arg == "--no-preview")
-            opts.no_preview = true;
-        else if (arg == "--frames")
-            opts.frames = std::stoi(value(i, arg));
-        else if (arg == "--threads")
-            opts.threads = std::stoi(value(i, arg));
-        else if (arg == "--det-every")
-            opts.det_every = std::stoi(value(i, arg));
-        else
-            throw std::runtime_error("Unknown argument: " + arg);
+        else if (arg == "--camera") o.camera = value();
+        else if (arg == "--width") o.width = std::stoi(value());
+        else if (arg == "--height") o.height = std::stoi(value());
+        else if (arg == "--hand") o.hand = value();
+        else if (arg == "--port") o.port = std::stoi(value());
+        else if (arg == "--model-dir") o.model_dir = value();
+        else if (arg == "--flip-input") o.flip_input = true;
+        else if (arg == "--no-preview") o.no_preview = true;
+        else if (arg == "--frames") o.frames = std::stoi(value());
+        else if (arg == "--threads") o.threads = std::stoi(value());
+        else if (arg == "--det-every") o.det_every = std::stoi(value());
+        else if (arg == "--profile") o.profile = true;
+        else if (arg == "--bench") o.bench = true;
+        else if (arg == "--bench-iters") o.bench_iters = std::stoi(value());
+        else throw std::runtime_error("unknown argument: " + arg);
     }
-
-    if (opts.frames < 0)
-        throw std::runtime_error("--frames must be nonnegative");
-
-    if (opts.port < 1 || opts.port > 65535)
-        throw std::runtime_error("--port must be between 1 and 65535");
-
-    if (opts.width <= 0 || opts.height <= 0)
-        throw std::runtime_error("--width and --height must be positive");
-
-    if (opts.threads <= 0)
-        throw std::runtime_error("--threads must be positive");
-
-    if (opts.det_every <= 0)
-        throw std::runtime_error("--det-every must be positive");
-
-    if (opts.hand != "left" && opts.hand != "right")
-        throw std::runtime_error("--hand must be left or right");
-
-    return opts;
+    if (o.hand != "left" && o.hand != "right") throw std::runtime_error("--hand must be left or right");
+    if (o.port < 1 || o.port > 65535) throw std::runtime_error("--port must be 1..65535");
+    if (o.width <= 0 || o.height <= 0) throw std::runtime_error("--width and --height must be positive");
+    if (o.frames < 0) throw std::runtime_error("--frames must not be negative");
+    if (o.threads <= 0 || o.det_every <= 0 || o.bench_iters <= 0)
+        throw std::runtime_error("--threads, --det-every and --bench-iters must be positive");
+    return o;
 }
 
-bool is_numeric(const std::string& value)
+bool is_number(const std::string& s)
 {
-    return !value.empty() &&
-           std::all_of(value.begin(), value.end(),
-                       [](unsigned char c) { return c >= '0' && c <= '9'; });
+    return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
 }
 
-// -----------------------------------------------------------------------------
-// Camera setup
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------------------------------------
 
-cv::VideoCapture open_camera(
-    const std::string& source,
-    int width,
-    int height)
+// A number opens that V4L2 camera (MJPG, 30 fps, --width x --height); anything else is opened as a video file.
+cv::VideoCapture open_camera(const Options& o)
 {
-    cv::VideoCapture capture;
-
-    if (is_numeric(source))
+    const bool is_camera = is_number(o.camera);
+    cv::VideoCapture cap;
+    if (is_camera) cap.open(std::stoi(o.camera), cv::CAP_V4L2);
+    else cap.open(o.camera);
+    if (!cap.isOpened()) throw std::runtime_error("could not open camera or video: " + o.camera);
+    if (is_camera)
     {
-        const int index = std::stoi(source);
-
-#ifdef __linux__
-        capture.open(index, cv::CAP_V4L2);
-#else
-        capture.open(index, cv::CAP_ANY);
-#endif
-
-        if (capture.isOpened())
-        {
-            capture.set(
-                cv::CAP_PROP_FOURCC,
-                cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-
-            capture.set(cv::CAP_PROP_FRAME_WIDTH, width);
-            capture.set(cv::CAP_PROP_FRAME_HEIGHT, height);
-            capture.set(cv::CAP_PROP_FPS, 30);
-        }
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, o.width);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, o.height);
+        cap.set(cv::CAP_PROP_FPS, 30);
     }
-    else
-    {
-        capture.open(source);
-    }
-
-    if (!capture.isOpened())
-        throw std::runtime_error("Could not open camera or video: " + source);
-
-    return capture;
+    return cap;
 }
 
-// -----------------------------------------------------------------------------
-// Background camera reader
-// Keeps only the newest frame. This allows camera capture to overlap inference.
-// -----------------------------------------------------------------------------
-
+// Reads the camera on its own thread and keeps only the newest frame, so capture overlaps inference and the
+// robot never lags behind by queued frames.
 class Grabber
 {
 public:
-    explicit Grabber(cv::VideoCapture& capture) : capture_(capture) {}
-
-    void start()
-    {
-        worker_ = std::thread(&Grabber::run, this);
-    }
-
-    void stop()
-    {
-        running_.store(false);
-
-        if (worker_.joinable())
-            worker_.join();
-
-        cond_.notify_all();
-    }
-
-    ~Grabber()
-    {
-        stop();
-    }
-
     struct Frame
     {
         cv::Mat image;
-        double stamp = 0.0;
-        uint64_t count = 0;
+        double stamp = 0; // capture time, now_s()
+        uint64_t count = 0; // frame number, 1 = first frame
     };
 
-    Frame next(uint64_t last_count, double timeout_seconds = 1.0)
+    explicit Grabber(cv::VideoCapture& cap) : cap_(cap), thread_(&Grabber::run, this) {}
+    ~Grabber()
+    {
+        running_ = false;
+        thread_.join();
+    }
+
+    // Waits up to 1 s for a frame newer than frame number `last`. On a timeout the result's count is still `last`.
+    Frame next(uint64_t last)
     {
         std::unique_lock<std::mutex> lock(mutex_);
-
-        const auto timeout = std::chrono::duration<double>(timeout_seconds);
-
-        cond_.wait_for(lock, timeout, [&]
-        {
-            return count_ != last_count || failures_ > 30 ||
-                   !running_.load();
-        });
-
-        if (failures_ > 30)
-            throw std::runtime_error("The camera stopped delivering frames.");
-
-        return Frame{frame_, stamp_, count_};
+        new_frame_.wait_for(lock, std::chrono::seconds(1), [&] { return newest_.count != last || failures_ > 30; });
+        if (failures_ > 30) throw std::runtime_error("the camera stopped delivering frames");
+        return newest_;
     }
 
 private:
     void run()
     {
-        while (running_.load())
+        while (running_)
         {
             cv::Mat image;
-            const bool ok = capture_.read(image);
-            const double now = monotonic_seconds();
-
+            const bool ok = cap_.read(image);
+            const double stamp = now_s();
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-
                 if (ok)
                 {
-                    frame_ = std::move(image);
-                    stamp_ = now;
-                    ++count_;
+                    newest_ = {image, stamp, newest_.count + 1};
                     failures_ = 0;
                 }
-                else
-                {
-                    ++failures_;
-                }
+                else ++failures_;
             }
-
-            cond_.notify_all();
-
-            if (!ok)
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            new_frame_.notify_all();
+            if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 
-    cv::VideoCapture& capture_;
-
-    std::thread worker_;
+    cv::VideoCapture& cap_;
     std::atomic<bool> running_{true};
-
     std::mutex mutex_;
-    std::condition_variable cond_;
-
-    cv::Mat frame_;
-    double stamp_ = 0.0;
-    uint64_t count_ = 0;
-    int failures_ = 0;
+    std::condition_variable new_frame_;
+    Frame newest_;
+    int failures_ = 0; // failed reads in a row
+    std::thread thread_; // last: starts after everything above is initialised
 };
 
+// ---------------------------------------------------------------------------------------------------------
+// Hand landmarks
+// ---------------------------------------------------------------------------------------------------------
 
-// -----------------------------------------------------------------------------
-// Hand landmark data
-// -----------------------------------------------------------------------------
-
+// A square hand box in image pixels, turned by `rotation` (radians) so that the fingers point up inside it.
 struct ROI
 {
-    double cx = 0.0;
-    double cy = 0.0;
-    double size = 0.0;
-    double rotation = 0.0;
+    double cx = 0, cy = 0, size = 0, rotation = 0;
 };
 
-struct DetectedHand
+struct Hand
 {
-    std::array<cv::Point2f, 21> screen;  // normalised image coordinates
-    std::array<float, 63> world;         // metres, wrist-centred, xyz per point
-
-    bool right = false;
-    float handedness_score = 0.0f;
+    std::array<cv::Point2f, 21> points; // landmarks in image pixels
+    std::array<float, 63> world;        // landmarks in metres, x y z per point
+    bool right = false;                 // the net sees a right hand
+    float side_score = 0;               // how sure it is about left/right, 0.5..1
 };
 
-// -----------------------------------------------------------------------------
-// ONNX inference helper
-// -----------------------------------------------------------------------------
-
-struct TensorOutput
+// The float data of one model output, checking that it has at least min_count values.
+const float* floats(const Ort::Value& output, size_t min_count)
 {
-    std::vector<int64_t> shape;
-    std::vector<float> values;
+    const auto info = output.GetTensorTypeAndShapeInfo();
+    if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || info.GetElementCount() < min_count)
+        throw std::runtime_error("unexpected model output");
+    return output.GetTensorData<float>();
+}
+
+// One ONNX model. Its input layout (NCHW or NHWC) is taken from the model's input shape.
+class Model
+{
+public:
+    Model(Ort::Env& env, const std::string& path, int threads)
+    {
+        Ort::SessionOptions options;
+        options.SetIntraOpNumThreads(threads);
+        options.SetInterOpNumThreads(1);
+        session_ = Ort::Session(env, path.c_str(), options);
+
+        Ort::AllocatorWithDefaultOptions alloc;
+        input_name_ = session_.GetInputNameAllocated(0, alloc).get();
+        for (size_t i = 0; i < session_.GetOutputCount(); ++i)
+            output_names_.emplace_back(session_.GetOutputNameAllocated(i, alloc).get());
+        for (const auto& name : output_names_) output_ptrs_.push_back(name.c_str());
+
+        input_shape = session_.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+        nchw_ = input_shape.size() == 4 && input_shape[1] == 3;
+    }
+
+    // Runs the model on an RGB uint8 image of its input size; pixel values are scaled to 0..1.
+    std::vector<Ort::Value> run(const cv::Mat& rgb)
+    {
+        const int rows = rgb.rows, cols = rgb.cols;
+        input_.resize(static_cast<size_t>(rows) * cols * 3);
+        if (nchw_) // one float plane per colour
+        {
+            rgb.convertTo(scratch_, CV_32FC3, 1.0 / 255.0);
+            const size_t plane = static_cast<size_t>(rows) * cols;
+            cv::Mat planes[3] = {cv::Mat(rows, cols, CV_32F, input_.data()),
+                                 cv::Mat(rows, cols, CV_32F, input_.data() + plane),
+                                 cv::Mat(rows, cols, CV_32F, input_.data() + 2 * plane)};
+            cv::split(scratch_, planes);
+        }
+        else // interleaved, like the image
+        {
+            cv::Mat dst(rows, cols, CV_32FC3, input_.data());
+            rgb.convertTo(dst, CV_32FC3, 1.0 / 255.0);
+        }
+        std::vector<int64_t> shape = {1, rows, cols, 3};
+        if (nchw_) shape = {1, 3, rows, cols};
+        Ort::Value input =
+            Ort::Value::CreateTensor<float>(memory_, input_.data(), input_.size(), shape.data(), shape.size());
+        return run(input);
+    }
+
+    // Runs the model on a ready input tensor (used by --bench).
+    std::vector<Ort::Value> run(Ort::Value& input)
+    {
+        const char* name = input_name_.c_str();
+        return session_.Run(Ort::RunOptions{nullptr}, &name, &input, 1, output_ptrs_.data(), output_ptrs_.size());
+    }
+
+    std::vector<int64_t> input_shape; // as declared by the model; -1 for a free dimension
+
+private:
+    Ort::Session session_{nullptr};
+    std::string input_name_;
+    std::vector<std::string> output_names_;
+    std::vector<const char*> output_ptrs_; // point into output_names_
+    bool nchw_ = false;
+    Ort::MemoryInfo memory_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    std::vector<float> input_; // reused input buffer
+    cv::Mat scratch_;          // reused float image for NCHW
 };
 
+// Finds hands and their landmarks. The hand boxes for the next frame come from this frame's landmarks, so the
+// palm detector only runs every det_every frames, or when no hand is tracked.
 class HandLandmarker
 {
 public:
-    HandLandmarker(
-        const std::string& palm_path,
-        const std::string& landmark_path,
-        int num_hands = 2,
-        float threshold = 0.5f,
-        int threads = 4,
-        int det_every = 15)
-        : env_(ORT_LOGGING_LEVEL_WARNING, "DH116Hand"),
-          palm_options_(),
-          landmark_options_(),
-          num_hands_(num_hands),
-          threshold_(threshold),
-          det_every_(det_every)
+    HandLandmarker(const std::string& model_dir, int threads, int det_every)
+        : env_(ORT_LOGGING_LEVEL_WARNING, "DH116Hand"), palm_(env_, model_dir + "/hand_palm.onnx", threads),
+          landmark_(env_, model_dir + "/hand_landmark_detector.onnx", threads), det_every_(det_every)
     {
-        if (threads <= 0)
-            throw std::runtime_error("ONNX thread count must be positive");
-
-        if (det_every_ <= 0)
-            throw std::runtime_error("det_every must be positive");
-
-        palm_options_.SetIntraOpNumThreads(threads);
-        palm_options_.SetInterOpNumThreads(1);
-
-        landmark_options_.SetIntraOpNumThreads(threads);
-        landmark_options_.SetInterOpNumThreads(1);
-
-        palm_ = Ort::Session(env_, palm_path.c_str(), palm_options_);
-        landmark_ = Ort::Session(env_, landmark_path.c_str(),
-                                 landmark_options_);
-
-        palm_input_name_ = get_input_name(palm_, 0);
-        landmark_input_name_ = get_input_name(landmark_, 0);
-
-        palm_output_names_ = get_output_names(palm_);
-        landmark_output_names_ = get_output_names(landmark_);
     }
 
-    // Milliseconds spent in the palm / landmark stages (including preprocessing) since the caller last zeroed them.
-    double palm_ms = 0.0;
-    double landmark_ms = 0.0;
+    double palm_ms = 0, landmark_ms = 0; // time spent per stage, for --profile; the caller resets them
 
-    // want_right: once that hand is found, only it is tracked (saves a landmark pass per frame).
-    std::vector<DetectedHand> detect(const cv::Mat& rgb, bool want_right)
+    // Hands in an RGB image. Once a hand of the wanted side is found, only that one is tracked further.
+    std::vector<Hand> find(const cv::Mat& rgb, bool want_right)
     {
-        if (rgb.empty() || rgb.type() != CV_8UC3)
-            throw std::runtime_error("Expected a nonempty RGB uint8 image");
-
-        const int h = rgb.rows;
-        const int w = rgb.cols;
-
-        ++det_counter_;
-
-        const bool run_palm =
-            tracked_.empty() || (det_counter_ % det_every_ == 0);
-
-        if (run_palm)
+        ++frames_;
+        if (boxes_.empty() || frames_ % det_every_ == 0)
         {
-            const double t_palm = monotonic_seconds();
-            int pad_x = 0;
-            int pad_y = 0;
-            double scale = 0.0;
-
-            const cv::Mat palm_input = make_palm_input(
-                rgb, pad_x, pad_y, scale);
-
-            const auto palm_outputs = run_model(
-                palm_, palm_input_name_, palm_output_names_,
-                palm_input, true);
-
-            tracked_ = rois_from_palm_dets(
-                palm_outputs.at(0), pad_x, pad_y, scale);
-
-            palm_ms += (monotonic_seconds() - t_palm) * 1e3;
+            const double t0 = now_s();
+            boxes_ = palm_boxes(rgb);
+            palm_ms += (now_s() - t0) * 1e3;
         }
 
-        std::vector<DetectedHand> result;
-        std::vector<ROI> next_tracked;
-        std::vector<ROI> wanted_tracked;
-
-        for (const ROI& roi : tracked_)
+        std::vector<Hand> hands;
+        std::vector<ROI> next_boxes, wanted_boxes;
+        for (const ROI& box : boxes_)
         {
-            const double t_lm = monotonic_seconds();
-            cv::Mat affine;
-            cv::Mat crop = make_landmark_crop(rgb, roi, affine);
+            const double t0 = now_s();
+            cv::Matx23d to_crop;
+            const auto out = landmark_.run(crop(rgb, box, to_crop));
+            landmark_ms += (now_s() - t0) * 1e3;
 
-            const auto lm_outputs = run_model(
-                landmark_, landmark_input_name_,
-                landmark_output_names_, crop, false);
+            if (out.size() < 4) throw std::runtime_error("the landmark model must have 4 outputs");
+            const float* crop_xyz = floats(out[0], 63); // x y z per landmark, in crop pixels
+            const float presence = floats(out[1], 1)[0];
+            const float side = floats(out[2], 1)[0]; // > 0.5: right hand
+            const float* world = floats(out[3], 63);
+            if (presence < MIN_SCORE) continue;
 
-            landmark_ms += (monotonic_seconds() - t_lm) * 1e3;
-
-            if (lm_outputs.size() < 4 ||
-                lm_outputs[0].values.size() < 63 ||
-                lm_outputs[1].values.empty() ||
-                lm_outputs[2].values.empty() ||
-                lm_outputs[3].values.size() < 63)
-                throw std::runtime_error(
-                    "Landmark model must return 63 screen values, presence, "
-                    "handedness and 63 world values");
-
-            if (lm_outputs[1].values[0] < threshold_)
-                continue;
-
-            const float raw_hand = lm_outputs[2].values[0];
-
-            DetectedHand hand;
-            hand.right = raw_hand > 0.5f;
-            hand.handedness_score =
-                raw_hand > 0.5f ? raw_hand : 1.0f - raw_hand;
-
-            const auto& pts = lm_outputs[0].values;
-
-            cv::Mat inverse;
-            cv::invertAffineTransform(affine, inverse);
-
-            std::array<cv::Point2f, 21> xy_orig{};
-
+            Hand hand;
+            hand.right = side > 0.5f;
+            hand.side_score = hand.right ? side : 1.0f - side;
+            cv::Matx23d to_image;
+            cv::invertAffineTransform(to_crop, to_image);
             for (int i = 0; i < 21; ++i)
             {
-                const double x = pts[i * 3 + 0];
-                const double y = pts[i * 3 + 1];
-
-                xy_orig[i].x = static_cast<float>(
-                    inverse.at<double>(0, 0) * x +
-                    inverse.at<double>(0, 1) * y +
-                    inverse.at<double>(0, 2));
-
-                xy_orig[i].y = static_cast<float>(
-                    inverse.at<double>(1, 0) * x +
-                    inverse.at<double>(1, 1) * y +
-                    inverse.at<double>(1, 2));
-
-                hand.screen[i] = {
-                    xy_orig[i].x / static_cast<float>(w),
-                    xy_orig[i].y / static_cast<float>(h)
-                };
+                const cv::Vec2d p = to_image * cv::Vec3d(crop_xyz[3 * i], crop_xyz[3 * i + 1], 1.0);
+                hand.points[i] = cv::Point2f(static_cast<float>(p[0]), static_cast<float>(p[1]));
             }
+            std::copy_n(world, 63, hand.world.begin());
 
-            std::copy_n(lm_outputs[3].values.begin(), 63, hand.world.begin());
-
-            result.push_back(hand);
-            next_tracked.push_back(roi_from_landmarks(xy_orig));
-
-            if (hand.right == want_right)
-                wanted_tracked.push_back(next_tracked.back());
+            hands.push_back(hand);
+            next_boxes.push_back(box_from_landmarks(hand.points));
+            if (hand.right == want_right) wanted_boxes.push_back(next_boxes.back());
         }
-
-        tracked_ = wanted_tracked.empty() ? next_tracked : wanted_tracked;
-
-        return result;
+        boxes_ = wanted_boxes.empty() ? next_boxes : wanted_boxes;
+        return hands;
     }
 
 private:
-    static std::string get_input_name(
-        Ort::Session& session,
-        size_t index)
+    // Palm detector on a letterboxed copy of the image -> up to MAX_HANDS hand boxes, best first.
+    std::vector<ROI> palm_boxes(const cv::Mat& rgb)
     {
-        Ort::AllocatorWithDefaultOptions allocator;
-        auto name = session.GetInputNameAllocated(index, allocator);
-        return name.get();
+        // Letterbox: scale the longer side to PALM_SIZE and pad the shorter one with black.
+        const double scale = static_cast<double>(PALM_SIZE) / std::max(rgb.rows, rgb.cols);
+        const int w = static_cast<int>(rgb.cols * scale), h = static_cast<int>(rgb.rows * scale);
+        const int pad_x = (PALM_SIZE - w) / 2, pad_y = (PALM_SIZE - h) / 2;
+        cv::Mat input = cv::Mat::zeros(PALM_SIZE, PALM_SIZE, CV_8UC3);
+        cv::resize(rgb, input(cv::Rect(pad_x, pad_y, w, h)), cv::Size(w, h));
+
+        // One row per detection: score, box centre x y, box size, wrist x y, middle finger base x y,
+        // all relative to the palm input (0..1).
+        const auto out = palm_.run(input);
+        const auto info = out.at(0).GetTensorTypeAndShapeInfo();
+        if (info.GetShape().empty() || info.GetShape().back() != 8)
+            throw std::runtime_error("the palm model output must have 8 values per detection");
+        const float* rows = floats(out[0], 0);
+        std::vector<const float*> found;
+        for (size_t i = 0; i < info.GetElementCount() / 8; ++i)
+            if (rows[8 * i] >= MIN_SCORE) found.push_back(rows + 8 * i);
+        std::sort(found.begin(), found.end(), [](const float* a, const float* b) { return a[0] > b[0]; });
+        if (found.size() > MAX_HANDS) found.resize(MAX_HANDS);
+
+        // Undo the letterbox: palm input (0..1) -> image pixels.
+        auto px = [&](double v, int pad) { return (v * PALM_SIZE - pad) / scale; };
+        std::vector<ROI> boxes;
+        for (const float* d : found)
+        {
+            const double cx = px(d[1], pad_x), cy = px(d[2], pad_y);
+            const double size = static_cast<double>(d[3]) * PALM_SIZE / scale;
+            const double wrist_x = px(d[4], pad_x), wrist_y = px(d[5], pad_y);
+            const double finger_x = px(d[6], pad_x), finger_y = px(d[7], pad_y);
+            // Turn the wrist -> middle finger direction to point up (image y grows downwards).
+            const double rotation = 0.5 * M_PI - std::atan2(-(finger_y - wrist_y), finger_x - wrist_x);
+            boxes.push_back({cx + ROI_SHIFT * size * std::sin(rotation), cy - ROI_SHIFT * size * std::cos(rotation),
+                             ROI_SCALE * size, rotation});
+        }
+        return boxes;
     }
 
-    static std::vector<std::string> get_output_names(
-        Ort::Session& session)
+    // LM_SIZE x LM_SIZE crop of a hand box, fingers up. to_crop maps image pixels to crop pixels.
+    static cv::Mat crop(const cv::Mat& rgb, const ROI& box, cv::Matx23d& to_crop)
     {
-        Ort::AllocatorWithDefaultOptions allocator;
-        const size_t count = session.GetOutputCount();
-
-        std::vector<std::string> names;
-        names.reserve(count);
-
-        for (size_t i = 0; i < count; ++i)
-        {
-            auto name = session.GetOutputNameAllocated(i, allocator);
-            names.emplace_back(name.get());
-        }
-
-        return names;
+        const double scale = LM_SIZE / box.size, c = std::cos(-box.rotation), s = std::sin(-box.rotation);
+        to_crop = cv::Matx23d(scale * c, -scale * s, LM_SIZE / 2.0 - scale * (c * box.cx - s * box.cy), //
+                              scale * s, scale * c, LM_SIZE / 2.0 - scale * (s * box.cx + c * box.cy));
+        cv::Mat out;
+        cv::warpAffine(rgb, out, to_crop, cv::Size(LM_SIZE, LM_SIZE));
+        return out;
     }
 
-    static std::vector<const char*> c_string_pointers(
-        const std::vector<std::string>& strings)
+    // Hand box around the landmarks: turned by the wrist (0) -> middle finger base (9) direction, centred on
+    // their bounding box, 1.2 x its diagonal in size.
+    static ROI box_from_landmarks(const std::array<cv::Point2f, 21>& p)
     {
-        std::vector<const char*> result;
-        result.reserve(strings.size());
-
-        for (const auto& s : strings)
-            result.push_back(s.c_str());
-
-        return result;
-    }
-
-    // Converts to float in [0,1] into the reused input_ buffer. NHWC is one convertTo;
-    // NCHW converts and then splits the channels straight into input_.
-    void fill_input(const cv::Mat& rgb, bool nchw)
-    {
-        const int rows = rgb.rows;
-        const int cols = rgb.cols;
-
-        input_.resize(static_cast<size_t>(rows) * cols * 3);
-
-        constexpr double inv255 = 1.0 / 255.0;
-
-        if (!nchw)
+        const double dx = p[9].x - p[0].x, dy = p[9].y - p[0].y;
+        double min_x = p[0].x, max_x = p[0].x, min_y = p[0].y, max_y = p[0].y;
+        for (const auto& q : p)
         {
-            cv::Mat dst(rows, cols, CV_32FC3, input_.data());
-            rgb.convertTo(dst, CV_32FC3, inv255);
-            return;
+            min_x = std::min<double>(min_x, q.x);
+            max_x = std::max<double>(max_x, q.x);
+            min_y = std::min<double>(min_y, q.y);
+            max_y = std::max<double>(max_y, q.y);
         }
-
-        rgb.convertTo(scratch_, CV_32FC3, inv255);
-
-        const size_t plane = static_cast<size_t>(rows) * cols;
-        cv::Mat planes[3] = {
-            cv::Mat(rows, cols, CV_32F, input_.data()),
-            cv::Mat(rows, cols, CV_32F, input_.data() + plane),
-            cv::Mat(rows, cols, CV_32F, input_.data() + 2 * plane)};
-
-        cv::split(scratch_, planes);
-    }
-
-    static cv::Mat make_palm_input(
-        const cv::Mat& rgb,
-        int& pad_x,
-        int& pad_y,
-        double& scale)
-    {
-        const int h = rgb.rows;
-        const int w = rgb.cols;
-
-        scale = static_cast<double>(PALM_SIZE) / std::max(h, w);
-
-        const int nh = static_cast<int>(h * scale);
-        const int nw = static_cast<int>(w * scale);
-
-        pad_y = (PALM_SIZE - nh) / 2;
-        pad_x = (PALM_SIZE - nw) / 2;
-
-        cv::Mat resized;
-        cv::resize(rgb, resized, cv::Size(nw, nh));
-
-        cv::Mat padded = cv::Mat::zeros(
-            PALM_SIZE, PALM_SIZE, CV_8UC3);
-
-        resized.copyTo(
-            padded(cv::Rect(pad_x, pad_y, nw, nh)));
-
-        return padded;
-    }
-
-    std::vector<TensorOutput> run_model(
-        Ort::Session& session,
-        const std::string& input_name,
-        const std::vector<std::string>& output_names,
-        const cv::Mat& rgb,
-        bool nchw)
-    {
-        fill_input(rgb, nchw);
-        std::vector<float>& input_values = input_;
-
-        std::vector<int64_t> shape;
-
-        if (nchw)
-        {
-            shape = {
-                1, 3,
-                static_cast<int64_t>(rgb.rows),
-                static_cast<int64_t>(rgb.cols)
-            };
-        }
-        else
-        {
-            shape = {
-                1,
-                static_cast<int64_t>(rgb.rows),
-                static_cast<int64_t>(rgb.cols),
-                3
-            };
-        }
-
-        auto memory_info = Ort::MemoryInfo::CreateCpu(
-            OrtArenaAllocator, OrtMemTypeDefault);
-
-        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-            memory_info,
-            input_values.data(),
-            input_values.size(),
-            shape.data(),
-            shape.size());
-
-        const char* input_names[] = {input_name.c_str()};
-        const auto output_name_ptrs = c_string_pointers(output_names);
-
-        auto outputs = session.Run(
-            Ort::RunOptions{nullptr},
-            input_names,
-            &input_tensor,
-            1,
-            output_name_ptrs.data(),
-            output_name_ptrs.size());
-
-        std::vector<TensorOutput> result;
-        result.reserve(outputs.size());
-
-        for (auto& output : outputs)
-        {
-            if (!output.IsTensor())
-                throw std::runtime_error("ONNX output is not a tensor");
-
-            auto info = output.GetTensorTypeAndShapeInfo();
-
-            TensorOutput item;
-            item.shape = info.GetShape();
-
-            if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-                throw std::runtime_error(
-                    "Expected float32 ONNX model outputs");
-
-            const size_t count = info.GetElementCount();
-            const float* data = output.GetTensorData<float>();
-
-            item.values.assign(data, data + count);
-            result.push_back(std::move(item));
-        }
-
-        return result;
-    }
-
-    std::vector<ROI> rois_from_palm_dets(
-        const TensorOutput& output,
-        int pad_x,
-        int pad_y,
-        double scale)
-    {
-        std::vector<ROI> rois;
-
-        // Expected final dimension:
-        // [score, cx, cy, box_size, kp0_x, kp0_y, kp2_x, kp2_y]
-        if (output.shape.empty())
-            return rois;
-
-        const int64_t row_width = output.shape.back();
-
-        if (row_width < 8 ||
-            output.values.size() % static_cast<size_t>(row_width) != 0)
-        {
-            throw std::runtime_error(
-                "Unexpected palm model output shape");
-        }
-
-        struct Detection
-        {
-            float score;
-            const float* row;
-        };
-
-        std::vector<Detection> detections;
-
-        const size_t rows =
-            output.values.size() / static_cast<size_t>(row_width);
-
-        for (size_t i = 0; i < rows; ++i)
-        {
-            const float* row =
-                output.values.data() + i * row_width;
-
-            if (row[0] >= threshold_)
-                detections.push_back({row[0], row});
-        }
-
-        std::sort(
-            detections.begin(),
-            detections.end(),
-            [](const Detection& a, const Detection& b)
-            {
-                return a.score > b.score;
-            });
-
-        if (detections.size() > static_cast<size_t>(num_hands_))
-            detections.resize(num_hands_);
-
-        for (const auto& detection : detections)
-        {
-            const float* det = detection.row;
-
-            const double cx = det[1];
-            const double cy = det[2];
-            const double sz = det[3];
-
-            const double k0x = det[4];
-            const double k0y = det[5];
-            const double k2x = det[6];
-            const double k2y = det[7];
-
-            const double cx_px = (cx * PALM_SIZE - pad_x) / scale;
-            const double cy_px = (cy * PALM_SIZE - pad_y) / scale;
-
-            const double k0x_px = (k0x * PALM_SIZE - pad_x) / scale;
-            const double k0y_px = (k0y * PALM_SIZE - pad_y) / scale;
-
-            const double k2x_px = (k2x * PALM_SIZE - pad_x) / scale;
-            const double k2y_px = (k2y * PALM_SIZE - pad_y) / scale;
-
-            const double sz_px = sz * PALM_SIZE / scale;
-
-            const double rotation =
-                0.5 * M_PI -
-                std::atan2(
-                    -(k2y_px - k0y_px),
-                    k2x_px - k0x_px);
-
-            const double roi_sz = ROI_SCALE * sz_px;
-
-            const double roi_cx =
-                cx_px + ROI_SHIFT * sz_px * std::sin(rotation);
-
-            const double roi_cy =
-                cy_px - ROI_SHIFT * sz_px * std::cos(rotation);
-
-            rois.push_back({roi_cx, roi_cy, roi_sz, rotation});
-        }
-
-        return rois;
-    }
-
-    static cv::Mat make_landmark_crop(
-        const cv::Mat& rgb,
-        const ROI& roi,
-        cv::Mat& affine)
-    {
-        const double sf = LM_SIZE / roi.size;
-
-        const double cr = std::cos(-roi.rotation);
-        const double sr = std::sin(-roi.rotation);
-
-        // CV_64F is used so that the inverse transformation retains
-        // double-precision coefficients.
-        affine = (cv::Mat_<double>(2, 3) <<
-            sf * cr,
-            -sf * sr,
-            LM_SIZE / 2.0 -
-                sf * (cr * roi.cx - sr * roi.cy),
-
-            sf * sr,
-            sf * cr,
-            LM_SIZE / 2.0 -
-                sf * (sr * roi.cx + cr * roi.cy));
-
-        cv::Mat crop;
-
-        cv::warpAffine(
-            rgb,
-            crop,
-            affine,
-            cv::Size(LM_SIZE, LM_SIZE));
-
-        return crop;
-    }
-
-    static ROI roi_from_landmarks(
-        const std::array<cv::Point2f, 21>& points)
-    {
-        const double dx = points[9].x - points[0].x;
-        const double dy = points[9].y - points[0].y;
-
-        const double rotation =
-            0.5 * M_PI - std::atan2(-dy, dx);
-
-        double min_x = points[0].x;
-        double max_x = points[0].x;
-        double min_y = points[0].y;
-        double max_y = points[0].y;
-
-        for (const auto& p : points)
-        {
-            min_x = std::min(min_x, static_cast<double>(p.x));
-            max_x = std::max(max_x, static_cast<double>(p.x));
-            min_y = std::min(min_y, static_cast<double>(p.y));
-            max_y = std::max(max_y, static_cast<double>(p.y));
-        }
-
-        const double cx = (min_x + max_x) * 0.5;
-        const double cy = (min_y + max_y) * 0.5;
-
-        const double diagonal = std::hypot(max_x - min_x, max_y - min_y);
-
-        return {cx, cy, diagonal * 1.2, rotation};
+        return {(min_x + max_x) * 0.5, (min_y + max_y) * 0.5, std::hypot(max_x - min_x, max_y - min_y) * 1.2,
+                0.5 * M_PI - std::atan2(-dy, dx)};
     }
 
     Ort::Env env_;
-    Ort::SessionOptions palm_options_;
-    Ort::SessionOptions landmark_options_;
-
-    Ort::Session palm_{nullptr};
-    Ort::Session landmark_{nullptr};
-
-    std::string palm_input_name_;
-    std::string landmark_input_name_;
-
-    std::vector<std::string> palm_output_names_;
-    std::vector<std::string> landmark_output_names_;
-
-    int num_hands_ = 2;
-    float threshold_ = 0.5f;
-
-    std::vector<float> input_;  // reused model input buffer
-    cv::Mat scratch_;           // reused float image for the NCHW path
-    int det_every_ = 15;
-    uint64_t det_counter_ = 0;
-
-    std::vector<ROI> tracked_;
+    Model palm_, landmark_;
+    int det_every_;
+    uint64_t frames_ = 0;
+    std::vector<ROI> boxes_; // hand boxes to look in on the next frame
 };
 
-// -----------------------------------------------------------------------------
-// UDP socket
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
+// UDP link to mimic_ctrl
+// ---------------------------------------------------------------------------------------------------------
 
-class UdpClient
+// Non-blocking UDP socket to mimic_ctrl on 127.0.0.1: sending never waits, replies are polled.
+class Link
 {
 public:
-    explicit UdpClient(int port)
+    explicit Link(int port)
     {
-        fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+        fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        if (fd_ < 0) throw std::runtime_error("could not create the UDP socket");
+        to_.sin_family = AF_INET;
+        to_.sin_port = htons(static_cast<uint16_t>(port));
+        to_.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
+    ~Link() { ::close(fd_); }
+    Link(const Link&) = delete;
+    Link& operator=(const Link&) = delete;
 
-        if (fd_ < 0)
-            throw std::runtime_error("Could not create UDP socket");
-
-        const int flags = fcntl(fd_, F_GETFL, 0);
-
-        if (flags < 0 || fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0)
-        {
-            ::close(fd_);
-            fd_ = -1;
-            throw std::runtime_error("Could not make UDP socket non-blocking");
-        }
-
-        target_ = {};
-        target_.sin_family = AF_INET;
-        target_.sin_port = htons(static_cast<uint16_t>(port));
-
-        if (inet_pton(AF_INET, "127.0.0.1", &target_.sin_addr) != 1)
-        {
-            ::close(fd_);
-            fd_ = -1;
-            throw std::runtime_error("Could not configure UDP destination");
-        }
+    bool send(const landmarks_msg& m)
+    {
+        return sendto(fd_, &m, sizeof(m), 0, reinterpret_cast<const sockaddr*>(&to_), sizeof(to_)) ==
+               static_cast<ssize_t>(sizeof(m));
     }
 
-    ~UdpClient()
+    // The newest valid reply received since the last call, if any.
+    std::optional<status_msg> newest_reply()
     {
-        close();
-    }
-
-    void send(const tp_landmarks& packet)
-    {
-        const ssize_t sent = sendto(
-            fd_,
-            &packet,
-            sizeof(packet),
-            0,
-            reinterpret_cast<const sockaddr*>(&target_),
-            sizeof(target_));
-
-        if (sent < 0)
-            throw std::runtime_error(
-                std::string("UDP send failed: ") + std::strerror(errno));
-
-        if (static_cast<size_t>(sent) != sizeof(packet))
-            throw std::runtime_error("UDP packet was not sent completely");
-    }
-
-    std::vector<tp_status> receive_all()
-    {
-        std::vector<tp_status> results;
-        tp_status buffer;
-
-        while (true)
+        std::optional<status_msg> newest;
+        status_msg s;
+        ssize_t n;
+        while ((n = recv(fd_, &s, sizeof(s), MSG_TRUNC)) >= 0)
         {
-            const ssize_t received = recvfrom(
-                fd_, &buffer, sizeof(buffer), 0, nullptr, nullptr);
-
-            if (received < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-
-                break;
-            }
-
-            if (static_cast<size_t>(received) == sizeof(buffer) &&
-                buffer.magic == TP_MAGIC_STATUS &&
-                buffer.version == TP_VERSION)
-            {
-                buffer.msg[sizeof(buffer.msg) - 1] = '\0';
-                results.push_back(buffer);
-            }
+            if (n != static_cast<ssize_t>(sizeof(s)) || s.version != MSG_VERSION) continue;
+            s.text[sizeof(s.text) - 1] = '\0';
+            newest = s;
         }
-
-        return results;
-    }
-
-    void close()
-    {
-        if (fd_ >= 0)
-        {
-            ::close(fd_);
-            fd_ = -1;
-        }
+        return newest;
     }
 
 private:
     int fd_ = -1;
-    sockaddr_in target_{};
+    sockaddr_in to_{};
 };
 
-// -----------------------------------------------------------------------------
-// Preview drawing
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
+// Preview
+// ---------------------------------------------------------------------------------------------------------
 
-cv::Mat draw_preview(
-    cv::Mat image,
-    const std::vector<DetectedHand>& hands,
-    int selected,
-    const std::optional<tp_status>& status,
-    const std::vector<std::string>& lines)
+// Draws the hand skeletons (the tracked hand in colour), mirrors the image so the operator sees a mirror view,
+// then adds the text lines at the top and one bar per joint: target filled orange, measured as a green tick.
+void draw_preview(cv::Mat& image, const std::vector<Hand>& hands, int selected, const status_msg* status,
+                  const std::vector<std::string>& lines)
 {
-    const int height = image.rows;
-    const int width = image.cols;
-
-    for (size_t index = 0; index < hands.size(); ++index)
+    for (size_t i = 0; i < hands.size(); ++i)
     {
-        const auto& landmarks = hands[index].screen;
-
-        std::array<cv::Point, 21> points;
-
-        for (int i = 0; i < 21; ++i)
-        {
-            points[i] = cv::Point(
-                static_cast<int>(landmarks[i].x * width),
-                static_cast<int>(landmarks[i].y * height));
-        }
-
-        const cv::Scalar color =
-            static_cast<int>(index) == selected
-                ? cv::Scalar(80, 220, 80)
-                : cv::Scalar(150, 150, 150);
-
-        for (const auto& edge : CONNECTIONS)
-        {
-            cv::line(
-                image,
-                points[edge.first],
-                points[edge.second],
-                color,
-                2);
-        }
-
-        for (const auto& point : points)
-        {
-            const cv::Scalar point_color =
-                static_cast<int>(index) == selected
-                    ? cv::Scalar(40, 40, 230)
-                    : color;
-
-            cv::circle(image, point, 3, point_color, -1);
-        }
+        const bool tracked = static_cast<int>(i) == selected;
+        const cv::Scalar color = tracked ? cv::Scalar(80, 220, 80) : cv::Scalar(150, 150, 150);
+        const auto& p = hands[i].points;
+        for (const auto& bone : BONES) cv::line(image, p[bone.first], p[bone.second], color, 2);
+        for (const auto& point : p) cv::circle(image, point, 3, tracked ? cv::Scalar(40, 40, 230) : color, -1);
     }
-
     cv::flip(image, image, 1);
 
-    cv::rectangle(
-        image,
-        cv::Point(0, 0),
-        cv::Point(width, 14 + 20 * static_cast<int>(lines.size())),
-        cv::Scalar(0, 0, 0),
-        -1);
+    const cv::Scalar black(0, 0, 0), white(255, 255, 255);
+    const int h = image.rows;
+    cv::rectangle(image, cv::Point(0, 0), cv::Point(image.cols, 14 + 20 * static_cast<int>(lines.size())), black, -1);
+    cv::rectangle(image, cv::Point(0, h - 30 - 20 * 6), cv::Point(272, h), black, -1);
+    for (size_t r = 0; r < lines.size(); ++r)
+        cv::putText(image, lines[r], cv::Point(10, 22 + 20 * static_cast<int>(r)), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                    white, 1);
 
-    cv::rectangle(
-        image,
-        cv::Point(0, height - 30 - 20 * static_cast<int>(LABELS.size())),
-        cv::Point(272, height),
-        cv::Scalar(0, 0, 0),
-        -1);
-
-    for (size_t row = 0; row < lines.size(); ++row)
+    auto bar_x = [](int pos) { return 110 + static_cast<int>(150.0 * std::clamp(pos, 0, POS_MAX) / POS_MAX); };
+    for (int j = 0; j < 6; ++j)
     {
-        cv::putText(
-            image,
-            lines[row],
-            cv::Point(10, 22 + 20 * static_cast<int>(row)),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.5,
-            cv::Scalar(255, 255, 255),
-            1);
-    }
-
-    for (size_t row = 0; row < LABELS.size(); ++row)
-    {
-        const int y =
-            height - 12 -
-            20 * (static_cast<int>(LABELS.size()) - 1 -
-                  static_cast<int>(row));
-
-        cv::putText(
-            image,
-            LABELS[row],
-            cv::Point(10, y),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.45,
-            cv::Scalar(255, 255, 255),
-            1);
-
-        cv::rectangle(
-            image,
-            cv::Point(110, y - 11),
-            cv::Point(260, y + 1),
-            cv::Scalar(60, 60, 60),
-            -1);
-
-        if (status.has_value())
+        const int y = h - 12 - 20 * (5 - j);
+        cv::putText(image, JOINT_NAMES[j], cv::Point(10, y), cv::FONT_HERSHEY_SIMPLEX, 0.45, white, 1);
+        cv::rectangle(image, cv::Point(110, y - 11), cv::Point(260, y + 1), cv::Scalar(60, 60, 60), -1);
+        if (!status) continue;
+        cv::rectangle(image, cv::Point(110, y - 11), cv::Point(bar_x(status->target[j]), y + 1),
+                      cv::Scalar(80, 200, 255), -1);
+        if (status->got_feedback)
         {
-            const int target_x =
-                110 + static_cast<int>(
-                    150.0 * status->target[row] / 10000.0);
-
-            cv::rectangle(
-                image,
-                cv::Point(110, y - 11),
-                cv::Point(target_x, y + 1),
-                cv::Scalar(80, 200, 255),
-                -1);
-
-            if (status->have_fb)
-            {
-                const int measured = std::clamp<int>(
-                    status->measured[row], 0, 10000);
-
-                const int x =
-                    110 + static_cast<int>(150.0 * measured / 10000.0);
-
-                cv::line(
-                    image,
-                    cv::Point(x, y - 14),
-                    cv::Point(x, y + 4),
-                    cv::Scalar(80, 255, 80),
-                    2);
-            }
+            const int x = bar_x(status->measured[j]);
+            cv::line(image, cv::Point(x, y - 14), cv::Point(x, y + 4), cv::Scalar(80, 255, 80), 2);
         }
     }
-
-    return image;
 }
 
-// -----------------------------------------------------------------------------
-// --bench: same table as scripts/bench_models.py, through the ONNX Runtime linked here
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
+// --profile and --bench
+// ---------------------------------------------------------------------------------------------------------
 
-int run_bench(const Options& opts)
+// Average milliseconds per stage, printed every PROFILE_EVERY frames.
+struct Profile
+{
+    double wait_ms = 0, find_ms = 0, show_ms = 0;
+    int n = 0;
+
+    void add(double wait_s, double find_s, double show_s, HandLandmarker& lm)
+    {
+        wait_ms += wait_s * 1e3;
+        find_ms += find_s * 1e3;
+        show_ms += show_s * 1e3;
+        if (++n < PROFILE_EVERY) return;
+        std::printf("profile/frame ms: wait-camera %.1f | detect %.1f (palm %.1f, landmark %.1f) | draw+show %.1f\n",
+                    wait_ms / n, find_ms / n, lm.palm_ms / n, lm.landmark_ms / n, show_ms / n);
+        std::fflush(stdout);
+        wait_ms = find_ms = show_ms = lm.palm_ms = lm.landmark_ms = 0;
+        n = 0;
+    }
+};
+
+// Times each model alone on random input, like scripts/bench_models.py but with the ONNX Runtime linked here.
+int run_bench(const Options& opt)
 {
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DH116Bench");
+    const auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::mt19937 rng(0);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-
-    double median_ms[2] = {0, 0};
     const char* const files[2] = {"hand_palm.onnx", "hand_landmark_detector.onnx"};
+    double median_ms[2] = {0, 0};
 
-    std::cout << "threads " << opts.threads << ", " << opts.bench_iters << " timed runs, models "
-              << opts.model_dir << "\n\n   model    |   median     mean      p95      min  (ms)\n";
-
+    std::cout << "threads " << opt.threads << ", " << opt.bench_iters << " timed runs, models " << opt.model_dir
+              << "\n\n   model    |   median     mean      p95      min  (ms)\n";
     for (int m = 0; m < 2; ++m)
     {
-        Ort::SessionOptions so;
-        so.SetIntraOpNumThreads(opts.threads);
-        so.SetInterOpNumThreads(1);
-        Ort::Session session(env, (opts.model_dir + "/" + files[m]).c_str(), so);
-
-        Ort::AllocatorWithDefaultOptions alloc;
-        const std::string in_name = session.GetInputNameAllocated(0, alloc).get();
-        std::vector<std::string> out_names;
-        for (size_t i = 0; i < session.GetOutputCount(); ++i)
-            out_names.emplace_back(session.GetOutputNameAllocated(i, alloc).get());
-        std::vector<const char*> out_ptrs;
-        for (const auto& n : out_names)
-            out_ptrs.push_back(n.c_str());
-
-        std::vector<int64_t> shape = session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+        Model model(env, opt.model_dir + "/" + files[m], opt.threads);
+        std::vector<int64_t> shape = model.input_shape;
         size_t count = 1;
-        for (auto& d : shape)
-            count *= static_cast<size_t>(d = std::max<int64_t>(d, 1));
+        for (auto& d : shape) count *= static_cast<size_t>(d = std::max<int64_t>(d, 1)); // free dimension -> 1
         std::vector<float> data(count);
-        for (auto& v : data)
-            v = dist(rng);
-
-        const auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        Ort::Value input = Ort::Value::CreateTensor<float>(mem, data.data(), data.size(), shape.data(), shape.size());
-        const char* in_ptr = in_name.c_str();
+        for (auto& v : data) v = dist(rng);
+        Ort::Value input =
+            Ort::Value::CreateTensor<float>(memory, data.data(), data.size(), shape.data(), shape.size());
 
         std::vector<double> ms;
-        for (int i = 0; i < 10 + opts.bench_iters; ++i)
+        for (int i = 0; i < 10 + opt.bench_iters; ++i) // the first 10 runs are warm-up
         {
-            const double t0 = monotonic_seconds();
-            session.Run(Ort::RunOptions{nullptr}, &in_ptr, &input, 1, out_ptrs.data(), out_ptrs.size());
-            if (i >= 10)
-                ms.push_back((monotonic_seconds() - t0) * 1e3);
+            const double t0 = now_s();
+            model.run(input);
+            if (i >= 10) ms.push_back((now_s() - t0) * 1e3);
         }
-
         std::sort(ms.begin(), ms.end());
         double sum = 0;
-        for (double v : ms)
-            sum += v;
+        for (double v : ms) sum += v;
         median_ms[m] = ms[ms.size() / 2];
-        std::printf("%-10s  | %8.2f %8.2f %8.2f %8.2f\n", m == 0 ? "palm" : "landmark", median_ms[m],
-                    sum / ms.size(), ms[std::min(ms.size() - 1, static_cast<size_t>(ms.size() * 0.95))], ms[0]);
+        std::printf("%-10s  | %8.2f %8.2f %8.2f %8.2f\n", m == 0 ? "palm" : "landmark", median_ms[m], sum / ms.size(),
+                    ms[std::min(ms.size() - 1, static_cast<size_t>(ms.size() * 0.95))], ms[0]);
     }
 
-    const double steady = median_ms[1];
-    const double average = steady + median_ms[0] / opts.det_every;
+    const double steady = median_ms[1], average = steady + median_ms[0] / opt.det_every;
     std::printf("\nper frame (palm every %d): steady %.2f ms, average %.2f ms, spike %.2f ms, %.1f fps\n",
-                opts.det_every, steady, average, steady + median_ms[0], 1000.0 / average);
+                opt.det_every, steady, average, steady + median_ms[0], 1000.0 / average);
     return 0;
 }
 
-// -----------------------------------------------------------------------------
-// Main
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------------------------------------
 
-int main(int argc, char** argv)
+int run(const Options& opt)
 {
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+    HandLandmarker landmarker(opt.model_dir, opt.threads, opt.det_every);
+    cv::VideoCapture cap = open_camera(opt);
+    std::unique_ptr<Grabber> grabber; // cameras only; a video file is read frame by frame
+    if (is_number(opt.camera)) grabber = std::make_unique<Grabber>(cap);
+    Link link(opt.port);
 
-    Options args;
+    const bool right = opt.hand == "right";
+    std::cout << "Tracking your " << opt.hand << " hand -> mimic_ctrl on 127.0.0.1:" << opt.port << ". " << HELP
+              << std::endl;
 
-    try
-    {
-        args = parse_args(argc, argv);
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << "Argument error: " << e.what() << "\n";
-        print_usage(argv[0]);
-        return 2;
-    }
-
-#ifdef HAND_CAM_HEADLESS
-    args.no_preview = true;
-#endif
-
-    if (args.bench)
-    {
-        try
-        {
-            return run_bench(args);
-        }
-        catch (const std::exception& e)
-        {
-            std::cerr << "bench error: " << e.what() << "\n";
-            return 2;
-        }
-    }
-
-    const std::string model_dir = args.model_dir;
-    const std::string palm_path =
-        model_dir + "/hand_palm.onnx";
-
-    const std::string landmark_path =
-        model_dir + "/hand_landmark_detector.onnx";
-
-    if (::access(palm_path.c_str(), R_OK) != 0)
-    {
-        std::cerr << "ONNX model not found: " << palm_path << "\n";
-        return 2;
-    }
-
-    if (::access(landmark_path.c_str(), R_OK) != 0)
-    {
-        std::cerr << "ONNX model not found: " << landmark_path << "\n";
-        return 2;
-    }
-
-    std::unique_ptr<HandLandmarker> landmarker;
-    cv::VideoCapture capture;
-    std::unique_ptr<Grabber> grabber;
-    std::unique_ptr<UdpClient> sock;
-
-    try
-    {
-        landmarker = std::make_unique<HandLandmarker>(
-            palm_path,
-            landmark_path,
-            2,
-            0.5f,
-            args.threads,
-            args.det_every);
-
-        capture = open_camera(args.camera, args.width, args.height);
-
-        const bool is_file = !is_numeric(args.camera);
-
-        if (!is_file)
-        {
-            grabber = std::make_unique<Grabber>(capture);
-            grabber->start();
-        }
-
-        sock = std::make_unique<UdpClient>(args.port);
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << "hand_cam error: " << e.what() << "\n";
-
-        if (grabber)
-            grabber->stop();
-
-        capture.release();
-        return 2;
-    }
-
-    const bool right = args.hand == "right";
-
-    uint32_t seq = 0;
-    int frames = 0;
-
-    uint64_t count = 0;
-
-    uint8_t cal = TP_CAL_NONE;
-
-    double fps = 0.0;
-    double previous = monotonic_seconds();
-
-    std::optional<tp_status> status;
-    double status_time = 0.0;
-
-    std::string message;
-
-    std::cout
-        << "Tracking your " << args.hand
-        << " hand -> dh116_teleop on 127.0.0.1:"
-        << args.port << ". " << HELP << std::endl;
+    uint64_t last_frame = 0;      // grabber frame number of the last frame used
+    int frames = 0;               // frames processed
+    int calibrate = MSG_CAL_NONE; // key pressed on the previous frame, sent with the next message
+    double fps = 0, previous = now_s();
+    std::optional<status_msg> status; // newest reply from mimic_ctrl
+    double status_time = 0;
+    std::string message; // newest status text (or send error); printed when mimic_ctrl changes it
+    Profile profile;
 
     int exit_code = 0;
-
-    // --profile accumulators (ms), reported every PROFILE_EVERY frames.
-    constexpr int PROFILE_EVERY = 30;
-    double prof_wait = 0.0, prof_detect = 0.0, prof_show = 0.0;
-    int prof_n = 0;
-    landmarker->palm_ms = landmarker->landmark_ms = 0.0;
-
     try
     {
-        while (!g_interrupted.load() &&
-               (!args.frames || frames < args.frames))
+        while (!g_stop && (opt.frames == 0 || frames < opt.frames))
         {
-            const double t_loop = monotonic_seconds();
+            const double t_loop = now_s();
             cv::Mat image;
-            double stamp = 0.0;
-
+            double stamp;
             if (grabber)
             {
-                auto frame = grabber->next(count);
-
+                const Grabber::Frame frame = grabber->next(last_frame);
+                if (frame.count == last_frame) continue; // no new frame within 1 s
                 image = frame.image;
                 stamp = frame.stamp;
-                count = frame.count;
-
-                if (image.empty())
-                    continue;
+                last_frame = frame.count;
             }
             else
             {
-                const bool ok = capture.read(image);
-                stamp = monotonic_seconds();
-
-                if (!ok || image.empty())
-                    break;
+                if (!cap.read(image)) break; // end of the video file
+                stamp = now_s();
             }
+            const double t_got = now_s();
 
-            const double t_got = monotonic_seconds();
-
-            if (args.flip_input)
-                cv::flip(image, image, 1);
-
+            if (opt.flip_input) cv::flip(image, image, 1);
             cv::Mat rgb;
             cv::cvtColor(image, rgb, cv::COLOR_BGR2RGB);
+            const std::vector<Hand> hands = landmarker.find(rgb, right);
+            const double t_found = now_s();
 
-            const std::vector<DetectedHand> hands =
-                landmarker->detect(rgb, right);
-
-            const double t_detected = monotonic_seconds();
-
+            // The hand to follow: the one of the wanted side the net is most sure about.
             int selected = -1;
-            float selected_score = -1.0f;
-
             for (size_t i = 0; i < hands.size(); ++i)
-            {
-                if (hands[i].right == right &&
-                    hands[i].handedness_score >= selected_score)
-                {
+                if (hands[i].right == right && (selected < 0 || hands[i].side_score >= hands[selected].side_score))
                     selected = static_cast<int>(i);
-                    selected_score = hands[i].handedness_score;
-                }
-            }
 
-            const std::array<float, 63>* world =
-                selected >= 0 ? &hands[selected].world : nullptr;
-
-            try
+            landmarks_msg msg{};
+            msg.version = MSG_VERSION;
+            msg.flags = right ? MSG_RIGHT_HAND : 0;
+            msg.calibrate = static_cast<uint8_t>(calibrate);
+            msg.time_s = stamp;
+            if (selected >= 0)
             {
-                sock->send(make_packet(
-                    seq, stamp, right, world, cal, false));
+                msg.flags |= MSG_HAND_SEEN;
+                std::memcpy(msg.world, hands[selected].world.data(), sizeof(msg.world));
             }
-            catch (const std::exception& e)
-            {
-                message = std::string("Send failed: ") + e.what();
-            }
+            if (!link.send(msg)) message = std::string("Send failed: ") + std::strerror(errno);
+            calibrate = MSG_CAL_NONE;
 
-            cal = TP_CAL_NONE;
-
-            // Non-blocking receive: consume all queued replies.
-            for (const auto& reply : sock->receive_all())
+            if (auto reply = link.newest_reply())
             {
                 status = reply;
-                status_time = monotonic_seconds();
+                status_time = now_s();
             }
-
-            ++seq;
+            const double now = now_s();
             ++frames;
-
-            const double now = monotonic_seconds();
-
-            if (frames > 1)
-            {
-                fps = 0.9 * fps +
-                      0.1 / std::max(now - previous, 1e-3);
-            }
-            else
-            {
-                fps = 0.0;
-            }
-
+            fps = frames > 1 ? 0.9 * fps + 0.1 / std::max(now - previous, 1e-3) : 0.0;
             previous = now;
-
-            const auto report = [&](double show_ms)
+            const bool alive = status && now - status_time < REPLY_TIMEOUT;
+            if (alive && message != status->text)
             {
-                if (!args.profile)
-                    return;
-
-                prof_wait += (t_got - t_loop) * 1e3;
-                prof_detect += (t_detected - t_got) * 1e3;
-                prof_show += show_ms;
-
-                if (++prof_n < PROFILE_EVERY)
-                    return;
-
-                std::printf(
-                    "profile/frame ms: wait-camera %.1f | detect %.1f "
-                    "(palm %.1f, landmark %.1f) | draw+show %.1f\n",
-                    prof_wait / prof_n, prof_detect / prof_n,
-                    landmarker->palm_ms / prof_n,
-                    landmarker->landmark_ms / prof_n, prof_show / prof_n);
-                std::fflush(stdout);
-
-                prof_wait = prof_detect = prof_show = 0.0;
-                landmarker->palm_ms = landmarker->landmark_ms = 0.0;
-                prof_n = 0;
-            };
-
-            const bool alive =
-                status.has_value() &&
-                (now - status_time < REPLY_TIMEOUT);
-
-            if (alive && message != status->msg)
-            {
-                message = status->msg;
+                message = status->text;
                 std::cout << message << std::endl;
             }
 
-            if (args.no_preview)
+            int key = -1;
+            const double t_show = now_s();
+            if (!opt.no_preview)
             {
-                report(0.0);
-                continue;
+                std::ostringstream top;
+                top << (right ? "RIGHT" : "LEFT") << " hand   " << std::fixed << std::setprecision(1) << fps
+                    << " FPS   " << (selected >= 0 ? "Hand detected" : "No " + opt.hand + " hand visible");
+                std::string state = "No reply from mimic_ctrl on port " + std::to_string(opt.port);
+                if (alive) state = status->dry_run ? "DRY RUN (no EtherCAT)" : "hand RUNNING";
+                draw_preview(image, hands, selected, alive ? &*status : nullptr, {top.str(), state, message, HELP});
+                gui::show(image);
+                key = gui::wait_key();
             }
+            if (opt.profile)
+                profile.add(t_got - t_loop, t_found - t_got, opt.no_preview ? 0 : now_s() - t_show, landmarker);
 
-            const double t_show = monotonic_seconds();
-
-            std::vector<std::string> lines;
-
-            lines.push_back(
-                args.hand == "left" ? "LEFT hand" : "RIGHT hand");
-
-            lines[0] += "   ";
-
-            {
-                std::ostringstream stream;
-                stream << std::fixed << std::setprecision(1)
-                       << fps << " FPS   "
-                       << (world
-                           ? "Hand detected"
-                           : "No " + args.hand + " hand visible");
-
-                lines[0] += stream.str();
-            }
-
-            static const std::array<const char*, 3> STATES = {
-                "DRY RUN (no EtherCAT)",
-                "hand RUNNING",
-                "stopping"
-            };
-
-            if (alive)
-            {
-                if (status->state < STATES.size())
-                    lines.push_back(STATES[status->state]);
-                else
-                    lines.push_back("?");
-            }
-            else
-            {
-                lines.push_back(
-                    "No reply from dh116_teleop on port " +
-                    std::to_string(args.port));
-            }
-
-            lines.push_back(message);
-            lines.push_back(HELP);
-
-            cv::Mat preview = draw_preview(
-                image,
-                hands,
-                selected,
-                alive ? status : std::nullopt,
-                lines);
-
-            gui::show(WINDOW_NAME, preview);
-
-            const int key = gui::wait_key(1) & 0xFF;
-
-            report((monotonic_seconds() - t_show) * 1e3);
-
-            if (key == 'q' || key == 27)
-                break;
-
-            if (!gui::visible(WINDOW_NAME))
-                break;
-
-            switch (key)
-            {
-                case 'o':
-                    cal = TP_CAL_OPEN;
-                    break;
-
-                case 'f':
-                    cal = TP_CAL_FIST;
-                    break;
-
-                case 'r':
-                    cal = TP_CAL_RESET;
-                    break;
-
-                default:
-                    cal = TP_CAL_NONE;
-                    break;
-            }
+            if (key == 'q' || key == 27 || (!opt.no_preview && !gui::visible())) break;
+            if (key == 'o') calibrate = MSG_CAL_OPEN;
+            if (key == 'f') calibrate = MSG_CAL_FIST;
+            if (key == 'r') calibrate = MSG_CAL_RESET;
         }
     }
     catch (const std::exception& e)
@@ -1611,31 +743,43 @@ int main(int argc, char** argv)
         exit_code = 2;
     }
 
-    // Tell the controller to open the hand and stop; repeated because UDP may drop one.
+    // Tell mimic_ctrl to open the hand and stop; three times, as UDP may drop one.
+    landmarks_msg quit{};
+    quit.version = MSG_VERSION;
+    quit.flags = MSG_QUIT;
     for (int i = 0; i < 3; ++i)
     {
-        try
-        {
-            sock->send(make_packet(
-                seq++, monotonic_seconds(), right, nullptr, TP_CAL_NONE, true));
-        }
-        catch (...)
-        {
-            // Continue cleanup even if the controller is unavailable.
-        }
-
+        link.send(quit);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-
-    if (grabber)
-        grabber->stop();
-
-    capture.release();
-
-    if (!args.no_preview)
-        gui::close_all();
-
-    sock->close();
-
     return exit_code;
+}
+
+int main(int argc, char** argv)
+{
+    Options opt;
+    try
+    {
+        opt = parse_args(argc, argv);
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Argument error: " << e.what() << "\n";
+        print_usage(argv[0]);
+        return 2;
+    }
+#ifdef HAND_CAM_HEADLESS
+    opt.no_preview = true;
+#endif
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+    try
+    {
+        return opt.bench ? run_bench(opt) : run(opt);
+    }
+    catch (const std::exception& e) // setup failed: models, camera or socket
+    {
+        std::cerr << "hand_cam error: " << e.what() << "\n";
+        return 2;
+    }
 }

@@ -23,14 +23,14 @@ endif()
 option(BUILD_HAND_CAM "Build the camera frontend (requires OpenCV and ONNX Runtime)" OFF)
 option(HAND_CAM_HEADLESS "Build the camera frontend without the GUI preview (no OpenCV highgui)" OFF)
 
-# C EtherCAT teleoperation controller
-add_executable(dh116_teleop src/dh116_teleop.c src/dh116_bus.c src/hand_math.c )
-target_include_directories(dh116_teleop PRIVATE "${PROJECT_INCLUDE_DIR}")
-target_link_libraries(dh116_teleop PRIVATE soem )
-target_compile_options(dh116_teleop PRIVATE -Wall -Wextra -Wpedantic )
+# C controller: hand math + EtherCAT
+add_executable(mimic_ctrl src/mimic_ctrl.c src/dh116.c src/hand_math.c)
+target_include_directories(mimic_ctrl PRIVATE "${PROJECT_INCLUDE_DIR}")
+target_link_libraries(mimic_ctrl PRIVATE soem)
+target_compile_options(mimic_ctrl PRIVATE -Wall -Wextra -Wpedantic)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(dh116_teleop PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
-    target_link_libraries(dh116_teleop PRIVATE m)
+    target_compile_definitions(mimic_ctrl PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+    target_link_libraries(mimic_ctrl PRIVATE m)
 endif()
 
 if(BUILD_HAND_CAM)

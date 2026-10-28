@@ -9,14 +9,17 @@ Cross-compiles the demo into a static riscv64 (RVA23, RVV 1.0) bundle:
   1. finds or downloads a riscv64-linux-gnu GCC toolchain (no root needed)
   2. builds static OpenCV (headless: V4L2 capture, JPEG/PNG)
   3. builds static ONNX Runtime with RISC-V Vector kernels
-  4. builds dh116_teleop and hand_cam
+  4. builds mimic_ctrl and hand_cam
   5. packs dist/dh116-riscv64-rva23.tar.gz
+
+The bundle's hand_cam has no preview window (always --no-preview). For the preview on the board,
+build natively on the board instead: ./scripts/build.sh (needs libopencv-dev there).
 
 Finished steps are skipped on later runs.
 
 Options:
   -j, --jobs N         Parallel jobs (default: min(CPU count, RAM / 3 GB))
-  --controller-only    Build only dh116_teleop (no OpenCV or ONNX Runtime)
+  --controller-only    Build only mimic_ctrl (no OpenCV or ONNX Runtime)
   --test               After building, smoke-test the bundle under qemu-user
                        (-cpu rva23u64,vlen=$QEMU_VLEN; default 256, as on the SpacemiT K3)
   --clean              Delete the project build and the bundle first
@@ -324,7 +327,7 @@ build_ort() {
 }
 
 build_project() {
-    local targets=(dh116_teleop) cmake_args=(
+    local targets=(mimic_ctrl) cmake_args=(
         -S "$REPO_ROOT"
         -B "$PROJECT_BUILD"
         "${GENERATOR[@]}"
@@ -365,7 +368,7 @@ make_bundle() {
     rm -rf -- "$BUNDLE" "$BUNDLE.tar.gz"
     mkdir -p "$BUNDLE/bin" "$BUNDLE/models"
 
-    for exe in dh116_teleop hand_cam; do
+    for exe in mimic_ctrl hand_cam; do
         [[ -f "$PROJECT_BUILD/$exe" ]] || continue
         verify_static_riscv64 "$PROJECT_BUILD/$exe"
         riscv64-linux-gnu-strip --strip-unneeded -o "$BUNDLE/bin/$exe" "$PROJECT_BUILD/$exe"
@@ -403,9 +406,9 @@ smoke_test() {
     command -v "$QEMU" >/dev/null || die "$QEMU not found (install qemu-user, or set QEMU=/path/to/qemu-riscv64)"
     mkdir -p "$LOGS"
 
-    log "Test: dh116_teleop --dry-run under $QEMU -cpu $cpu"
+    log "Test: mimic_ctrl --dry-run under $QEMU -cpu $cpu"
     out="$LOGS/test-controller.log"
-    timeout -s KILL 5 "$QEMU" -cpu "$cpu" "$BUNDLE/bin/dh116_teleop" --dry-run --port "$port" \
+    timeout -s KILL 5 "$QEMU" -cpu "$cpu" "$BUNDLE/bin/mimic_ctrl" --dry-run --port "$port" \
         --calibration "$BUNDLE/hand_calibration.json" >"$out" 2>&1 || status=$?
     # timeout stops a healthy controller with 124 or 137; anything else is a failure.
     ((status == 124 || status == 137)) || { cat "$out" >&2; die "controller exited early (status $status)"; }
@@ -423,7 +426,7 @@ smoke_test() {
     fi
 
     log "Test: hand_cam on a synthetic clip against a dry-run controller (slow under emulation)"
-    "$QEMU" -cpu "$cpu" "$BUNDLE/bin/dh116_teleop" --dry-run --port "$port" \
+    "$QEMU" -cpu "$cpu" "$BUNDLE/bin/mimic_ctrl" --dry-run --port "$port" \
         --calibration "$BUNDLE/hand_calibration.json" >"$LOGS/test-controller2.log" 2>&1 &
     local controller=$!
     status=0

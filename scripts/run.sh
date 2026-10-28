@@ -5,8 +5,8 @@ usage() {
     cat <<'EOF'
 Usage: ./scripts/run.sh [--dry-run] [camera options]
 
-Runs the C++ camera frontend and the C EtherCAT controller. Camera options are
-passed to hand_cam, for example: --hand right --camera 0 --flip-input.
+Runs hand_cam (camera + neural nets) and mimic_ctrl (EtherCAT controller). Camera options
+are passed to hand_cam, for example: --hand right --camera 0 --flip-input --no-preview.
 
 If either executable is missing in the repository checkout, scripts/build.sh runs
 first. To rebuild after a source change, run scripts/build.sh yourself.
@@ -16,8 +16,8 @@ Inside a riscv64 bundle the executables come from bin/ and nothing is built.
 Environment:
   DH116_IFACE          EtherCAT interface; required unless --dry-run (e.g. enp0s31f6)
   DH116_CAMERA         Default camera source (default: 0)
-  TELEOP_PORT          UDP port shared by both processes (default: 5006)
-  TELEOP_ARGS          Extra controller arguments, e.g. "--cur 600 --deadband 80"
+  MIMIC_PORT           UDP port shared by both processes (default: 5006)
+  CTRL_ARGS            Extra mimic_ctrl arguments, e.g. "--current 300 --deadband 80"
   DH116_BUILD_ROOT     Build root shared with build.sh (default: <repo>/build)
 
 Build options such as DH116_BUILD_TYPE and ONNXRUNTIME_ROOT are read by
@@ -45,11 +45,11 @@ if (( BUNDLE )); then
     BUILD_DIR="$ROOT_DIR/bin"
 fi
 IFACE="${DH116_IFACE:-}"
-PORT="${TELEOP_PORT:-5006}"
+PORT="${MIMIC_PORT:-5006}"
 CAMERA="${DH116_CAMERA:-0}"
 DRY_RUN=0
 CAMERA_ARGS=()
-CTRL_ARGS=()
+CTRL_EXTRA=()
 
 while (($#)); do
     case "$1" in
@@ -88,7 +88,7 @@ if (( ! DRY_RUN )) && [[ -z "$IFACE" ]]; then
 fi
 
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
-    die "TELEOP_PORT/--port must be between 1 and 65535"
+    die "MIMIC_PORT/--port must be between 1 and 65535"
 fi
 
 SUDO=()
@@ -97,7 +97,7 @@ if (( ! DRY_RUN && EUID != 0 )); then
     SUDO=(sudo -n)
 fi
 
-CONTROLLER="$BUILD_DIR/dh116_teleop"
+CONTROLLER="$BUILD_DIR/mimic_ctrl"
 CAMERA_APP="$BUILD_DIR/hand_cam"
 
 if (( BUNDLE )); then
@@ -124,14 +124,14 @@ if [[ "$CAMERA" =~ ^[0-9]+$ ]] && command -v v4l2-ctl >/dev/null; then
     fi
 fi
 
-if [[ -n "${TELEOP_ARGS:-}" ]]; then
-    read -r -a CTRL_ARGS <<< "$TELEOP_ARGS"
+if [[ -n "${CTRL_ARGS:-}" ]]; then
+    read -r -a CTRL_EXTRA <<< "$CTRL_ARGS"
 fi
 
 if (( DRY_RUN )); then
-    CTRL_CMD=("$CONTROLLER" --dry-run --port "$PORT" --calibration "$ROOT_DIR/hand_calibration.json" "${CTRL_ARGS[@]}")
+    CTRL_CMD=("$CONTROLLER" --dry-run --port "$PORT" --calibration "$ROOT_DIR/hand_calibration.json" "${CTRL_EXTRA[@]}")
 else
-    CTRL_CMD=("${SUDO[@]}" "$CONTROLLER" "$IFACE" --port "$PORT" --calibration "$ROOT_DIR/hand_calibration.json" "${CTRL_ARGS[@]}")
+    CTRL_CMD=("${SUDO[@]}" "$CONTROLLER" "$IFACE" --port "$PORT" --calibration "$ROOT_DIR/hand_calibration.json" "${CTRL_EXTRA[@]}")
 fi
 
 CAMERA_CMD=(

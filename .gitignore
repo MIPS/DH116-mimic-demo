@@ -32,6 +32,6 @@ compile_commands.json
 *.exe
 /dh116_move
 /src/dh116_move
-/dh116_teleop
+/mimic_ctrl
 /hand_cam
 trash/

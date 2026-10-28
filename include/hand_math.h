@@ -1,55 +1,50 @@
-/* hand_math.h - hand landmarks -> teleop features:
- * 21 MediaPipe-style world landmarks -> six features -> calibrated closure 0..1 -> One-Euro filter.
- * Palm rotation is left out: the physical hand has no wrist. Pure C, no SOEM.
- * Feature/actuator order: thumb sweep, thumb bend, index, middle, ring, little.
+/* hand_math.h - hand landmarks -> how closed each robot joint should be.
+ * 21 MediaPipe-style world landmarks -> six joint features -> calibrated closure 0 (open) .. 1 (fist)
+ * -> One-Euro filter. Palm rotation is left out: the robot hand has no wrist. Plain C, no SOEM.
+ * Joint order: thumb sweep, thumb bend, index, middle, ring, little.
  */
 #ifndef HAND_MATH_H
 #define HAND_MATH_H
 #include <stddef.h>
 
-#define HM_N 6
-#define HM_SAMPLES 60
-#define HM_CAL_SECONDS 0.5
+#define HM_JOINTS 6
+#define HM_RECENT 60 /* recent feature samples kept for calibration (2 s at 30 fps) */
 
+/* hm_tracker_calibrate kinds */
+#define HM_CAL_OPEN 1
+#define HM_CAL_FIST 2
+#define HM_CAL_RESET 3
+
+/* Feature value of an open hand and of a fist, per joint. */
 typedef struct
 {
-   double open[HM_N], closed[HM_N];
+    double open[HM_JOINTS], closed[HM_JOINTS];
 } hm_calib;
 
 typedef struct
 {
-   double min_cutoff, beta, dcutoff;
-   int has;
-   double value[HM_N], speed[HM_N], time;
+    double min_cutoff, beta;
+    int started;
+    double value[HM_JOINTS], speed[HM_JOINTS], time;
 } hm_euro;
 
 typedef struct
 {
-   hm_calib cal;
-   char cal_path[512];
-   hm_euro filt;
-   double sample_t[HM_SAMPLES], sample_f[HM_SAMPLES][HM_N];
-   int nsamples, head;
-   char msg[64];
+    hm_calib cal;
+    char cal_path[512];
+    hm_euro filter;
+    double recent_time[HM_RECENT], recent_feat[HM_RECENT][HM_JOINTS]; /* ring buffer */
+    int n_recent, next_slot;
+    char msg[64]; /* calibration status for the GUI */
 } hm_tracker;
 
-/* 0 = ok, -1 = degenerate landmarks */
-int hm_features(const float pts[21][3], int mirror, double out[HM_N]);
+/* Loads the calibration from cal_path (no file = defaults). Returns 0, or -1 with err filled for a bad file. */
+int hm_tracker_init(hm_tracker *t, const char *cal_path, double min_cutoff, double beta, char *err, size_t n);
 
-void hm_calib_default(hm_calib *c);
-int hm_calib_validate(const hm_calib *c, char *err, size_t n);
-/* missing file -> defaults; returns 0 ok, -1 bad file (err filled) */
-int hm_calib_load(hm_calib *c, const char *path, char *err, size_t n);
-int hm_calib_save(const hm_calib *c, const char *path);
+/* pts NULL = no hand. Returns 1 and fills closure[] when the hand was usable; else 0 and the filter restarts. */
+int hm_tracker_update(hm_tracker *t, const float (*pts)[3], int mirror, double time_s, double closure[HM_JOINTS]);
 
-void hm_euro_init(hm_euro *f, double min_cutoff, double beta);
-void hm_euro_reset(hm_euro *f);
-void hm_euro_apply(hm_euro *f, const double in[HM_N], double t, double out[HM_N]);
-
-void hm_tracker_init(hm_tracker *t, const hm_calib *c, const char *path, double min_cutoff, double beta);
-/* pts NULL = no hand. Returns 1 and fills closure when a hand was usable, else 0 (filters reset). */
-int hm_tracker_update(hm_tracker *t, const float (*pts)[3], int mirror, double time_s, double closure[HM_N]);
-/* kind: 1 open, 2 fist, 3 reset (TP_CAL_*). Result text in t->msg. */
+/* Store the last 0.5 s of features as open hand / fist, or reset to defaults. Result text in t->msg. */
 void hm_tracker_calibrate(hm_tracker *t, int kind, double time_s);
 
 #endif

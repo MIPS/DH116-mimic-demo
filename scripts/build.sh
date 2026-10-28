@@ -8,14 +8,19 @@ Usage: ./scripts/build.sh [options]
 Builds everything the demo needs:
   1. initializes the third_party submodules (SOEM, onnxruntime) when empty
   2. builds ONNX Runtime from third_party/onnxruntime (first run only; slow)
-  3. builds dh116_teleop and hand_cam with CMake
+  3. builds mimic_ctrl and hand_cam with CMake
+
+Works on the dev host and natively on the board. hand_cam gets the preview window unless --headless
+is given (the preview needs OpenCV with highgui: sudo apt install libopencv-dev). scripts/build-riscv.sh
+instead cross-compiles a static, always headless bundle for the board.
 
 Options:
   -j, --jobs N         Parallel jobs (default: min(CPU count, RAM / 3 GB))
   --build-type TYPE    Release (default), Debug, RelWithDebInfo or MinSizeRel
   --ort-root PATH      Use an existing ONNX Runtime prefix (lib/ and include/)
                        instead of building the submodule
-  --controller-only    Build only dh116_teleop (no OpenCV or ONNX Runtime)
+  --controller-only    Build only mimic_ctrl (no OpenCV or ONNX Runtime)
+  --headless           Build hand_cam without the preview window (no OpenCV highgui needed)
   --clean              Delete the project build directory (<root>/native) first
   --clean-ort          Delete the ONNX Runtime build and prefix first
   -h, --help           Show this help
@@ -50,6 +55,7 @@ ORT_ROOT="${ONNXRUNTIME_ROOT:-}"
 PYTHON="${PYTHON:-python3}"
 JOBS=""
 CONTROLLER_ONLY=0
+HEADLESS=OFF
 CLEAN=0
 CLEAN_ORT=0
 
@@ -79,6 +85,10 @@ while (($#)); do
             ;;
         --controller-only)
             CONTROLLER_ONLY=1
+            shift
+            ;;
+        --headless)
+            HEADLESS=ON
             shift
             ;;
         --clean)
@@ -169,12 +179,13 @@ ort_prefix_valid() {
 
 # Fail before the long ONNX Runtime build if the camera frontend cannot link.
 check_opencv() {
-    local probe
+    local probe components="core imgproc videoio"
+    [[ "$HEADLESS" == ON ]] || components+=" highgui"
     probe="$(mktemp -d)"
     printf '%s\n' \
         'cmake_minimum_required(VERSION 3.20)' \
         'project(probe LANGUAGES CXX)' \
-        'find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui videoio)' \
+        "find_package(OpenCV REQUIRED COMPONENTS $components)" \
         >"$probe/CMakeLists.txt"
     if ! cmake -S "$probe" -B "$probe/build" >"$probe/log" 2>&1; then
         sed 's/^/    /' "$probe/log" >&2
@@ -245,7 +256,7 @@ build_ort() {
 }
 
 build_project() {
-    local targets=(dh116_teleop) cmake_args=(
+    local targets=(mimic_ctrl) cmake_args=(
         -S "$REPO_ROOT"
         -B "$BUILD_DIR"
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
@@ -258,6 +269,7 @@ build_project() {
         # -U drops cached lookups so a changed ONNX Runtime prefix takes effect.
         cmake_args+=(
             -DBUILD_HAND_CAM=ON
+            -DHAND_CAM_HEADLESS="$HEADLESS"
             -DONNXRUNTIME_ROOT="$ORT_ROOT"
             -UONNXRUNTIME_LIBRARY
             -UONNXRUNTIME_INCLUDE_DIR
@@ -291,8 +303,9 @@ fi
 build_project
 
 log "Build complete"
-printf '  controller: %s/dh116_teleop\n' "$BUILD_DIR"
+printf '  controller: %s/mimic_ctrl\n' "$BUILD_DIR"
 if ((! CONTROLLER_ONLY)); then
     printf '  camera:     %s/hand_cam\n' "$BUILD_DIR"
+    [[ "$HEADLESS" == OFF ]] || printf '              (headless: no preview window)\n'
 fi
 printf '  next:       DH116_IFACE=<ethercat-interface> ./scripts/run.sh   (or ./scripts/run.sh --dry-run)\n'
