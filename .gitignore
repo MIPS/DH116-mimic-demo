@@ -3,6 +3,8 @@
 /dist/
 cmake-build*/
 CMakeUserPresets.json
+*.md
+!README.md
 
 # CMake caches and generated build-system files (including in-source builds).
 CMakeCache.txt

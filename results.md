@@ -35,6 +35,42 @@ int8 accuracy (x86, two sample images only): palm missed the hand in ~20% of fra
 
 Other: thread scaling is weak (fp32 8 threads: 2.3× palm, 4.5× landmark) and p95 is well above the median, probably from threads landing on both X100 and A100 clusters. Next step is `taskset` per cluster.
 
+## X100 vs A100 cores (VLEN 256 vs 1024)
+
+`/proc/cpuinfo`: CPUs 0–7 are `spacemit,x100` (VLEN 256), CPUs 8–15 are `spacemit,a100` (VLEN 1024). The A100 cores are only usable after `echo $$ > /proc/set_ai_thread`. The same static binary runs on both (no `zvl*b` flag). Unpinned runs earlier in this file only ever used the X100 cores. Pin runs to one cluster:
+
+```
+taskset -c 0-7 ./bin/hand_cam --bench --threads 8 --model-dir models
+bash -c 'echo $$ > /proc/set_ai_thread; exec taskset -c 8-15 ./bin/hand_cam --bench --threads 8 --model-dir models'
+```
+
+fp32, ORT source build, median ms:
+
+| Cores | Threads | Palm | Landmark |
+|---|---|---|---|
+| X100 | 1 | 60.4 | 38.0 |
+| X100 | 8 | 27.6 | 8.7 |
+| A100 | 1 | 196.6 | 114.1 |
+| A100 | 8 | 71.2 | 19.5 |
+
+The A100 is about 3× slower per core on both nets, and scales well (5.8× at 8 threads) with a tight p95.
+
+Raw vector microbenchmark (fp32 `vfmacc`, 4 independent chains, one core each):
+
+| | X100 | A100 |
+|---|---|---|
+| Clock (dependent addi chain) | ~1.82 GHz | ~1.80 GHz |
+| Scalar issue (independent adds) | 6.0 Ginstr/s | 3.8 Ginstr/s |
+| `vfmacc` m1 | vl=8, 0.50 ns | vl=32, 1.11 ns |
+| Peak fp32 | 32 GFLOP/s | 57.5 GFLOP/s |
+| ns per `vfmacc` vs LMUL | scales linearly | scales linearly |
+
+- **X100** has about a 256-bit FMA datapath (~16 FLOP/cycle).
+- **A100** has about a 512-bit datapath: one 1024-bit `vfmacc` takes 2 cycles (~32 FLOP/cycle). Peak is 1.8× X100, with weaker scalar issue (~2 vs ~3 instructions/cycle).
+- **Utilisation in the real net** (landmark, 662 MFLOP): X100 17.4 GFLOP/s (~54% of peak), A100 5.8 GFLOP/s (~10%). So the A100 is not slow in raw vector math; the stock ORT kernels use it very poorly.
+- Likely causes, not yet measured: loads or cache bandwidth feeding a 1024-bit register, lane waste from tails with small channel counts at 32 floats per vector, and loop/packing overhead on a narrower scalar pipeline.
+- **Takeaways:** VLEN alone does not predict speed; datapath width (DLEN), load bandwidth and kernel tiling do. For the K3 demo run on the X100 cores (`taskset -c 0-7`). A VLEN-1024 FPGA needs kernels tiled for its datapath rather than generic length-agnostic ones.
+
 ## Should we use a different runtime (e.g. IREE)?
 
 **K3: no.** fp32 ORT already runs at ~8.5 GMAC/s on one core and far exceeds the frame-rate target. A runtime swap would add effort for no needed gain.
