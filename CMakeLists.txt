@@ -34,7 +34,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(BUILD_HAND_CAM)
-    set(_opencv_components core imgproc videoio)
+    set(_opencv_components core imgproc imgcodecs videoio)
     if(NOT HAND_CAM_HEADLESS)
         list(APPEND _opencv_components highgui)
     endif()

@@ -23,7 +23,7 @@ The UDP messages are defined in [include/mimic_msg.h](include/mimic_msg.h). `han
 | `hand_cam` quits (Q/Esc) or `run.sh` gets Ctrl-C | `mimic_ctrl` opens the fingers, then disables the joints |
 | the EtherCAT cable is unplugged | `mimic_ctrl` stops after 100 ms without answers; the hand holds its last pose |
 
-Preview keys: `O` calibrates the open hand, `F` the fist, `R` resets the calibration (deletes `hand_calibration.json`).
+Preview keys (in the window, or on the `--web` page): `O` calibrates the open hand, `F` the fist, `R` resets the calibration (deletes `hand_calibration.json`).
 
 ## Quick Start
 
@@ -42,7 +42,7 @@ DH116_IFACE=enp0s31f6 ./scripts/run.sh                    # hardware run; see `i
 
 1. Initializes `third_party/SOEM` and `third_party/onnxruntime` if they are empty. ONNX Runtime fetches its own dependencies during its build, so its nested submodules are not initialized.
 2. Checks that CMake, a compiler, and OpenCV are available before starting the long build.
-3. Builds ONNX Runtime (Release, shared library, no tests) from the submodule into `build/deps/native/ort/` and installs `lib/` and `include/` into `build/prefix/native/`. This is repeated only if the submodule revision changes.
+3. Builds ONNX Runtime (Release, shared library, no tests) from the submodule into `build/deps/native/ort/` and installs `lib/` and `include/` into `build/prefix/native/`. This is repeated only if the submodule revision changes. On riscv64 it adds the RVV kernels (`--enable_rvv`).
 4. Configures and builds `mimic_ctrl` and `hand_cam` into `build/native/`.
 
 To skip the ONNX Runtime compile, point the script at an existing installation:
@@ -88,8 +88,27 @@ The toolchain file spells out the RVA23U64 extensions in `-march` because GCC 15
 
 Limitations:
 
-- `hand_cam` is headless in this build: it always runs with `--no-preview`, so there is no window and no `O`/`F`/`R` calibration keys. Calibrate with a build that has the preview and copy `hand_calibration.json` into the bundle before running. For the preview on the board itself, build natively on the board with `./scripts/build.sh` (needs `libopencv-dev` there; note that this compiles ONNX Runtime on the board, which is slow and has no RVV kernels, unless `--ort-root` points at an existing install).
-- Verified only under QEMU emulation (the controller in `--dry-run`, and `hand_cam` on a synthetic MJPEG clip). Not verified on real RISC-V hardware, with a real camera, or against a DH116 on EtherCAT.
+- `hand_cam` is headless in this build: it always runs with `--no-preview`, so there is no window. Use `--web PORT` (see [Run](#run)) to see the preview and use the `O`/`F`/`R` calibration keys in a web browser. For the preview window on the board itself, build natively on the board (next section).
+- `--test` checks the bundle only under QEMU (the controller in `--dry-run`, and `hand_cam` on a synthetic MJPEG clip). The bundle has also been run on a riscv64 board with a USB camera and the DH116 on EtherCAT.
+
+
+### Native build on a RISCV board
+
+For the preview window on a monitor attached to the board, build on the board itself with `./scripts/build.sh` (needs `libopencv-dev`, `cmake`, `g++`, and `python3` there). On riscv64, `build.sh` builds ONNX Runtime with `--enable_rvv`; without the RVV kernels it runs 20 to 50 times slower (palm 600 ms instead of 28 ms, under 1 fps). A library built before `build.sh` passed this flag is rebuilt once on the next run, reusing `build/deps/native/ort`.
+
+To check the result:
+
+```bash
+grep -E '^(onnxruntime_USE_RVV|HAS_RISCV64_RVV)' build/deps/native/ort/Release/CMakeCache.txt   # ON and 1
+nm -C build/prefix/native/lib/libonnxruntime.so | grep -c Rvv     # more than 0
+build/native/hand_cam --bench --threads 4 --model-dir models      # palm ~28 ms, landmark ~15 ms
+```
+
+If the compiler cannot build the RVV kernels, the ONNX Runtime configure step prints "Falling back to scalar MLAS kernels". ONNX Runtime selects the RVV kernels at run time when the kernel reports the V extension, and `ORT_MLAS_RISCV_FORCE_SCALAR=1` forces the scalar kernels, which compares both with the same library:
+
+```bash
+ORT_MLAS_RISCV_FORCE_SCALAR=1 build/native/hand_cam --bench --threads 4 --model-dir models
+```
 
 
 
@@ -98,7 +117,10 @@ Limitations:
 
 `run.sh` starts the controller and the camera program and stops both when either exits. It builds first only if an executable is missing.
 
-Camera options such as `--camera 1`, `--hand right`, `--flip-input`, and `--no-preview` are passed to `hand_cam`. Give the camera as an index (`--camera 1`), not as `/dev/video1`: a path is opened as a video file.
+Camera options such as `--camera 1`, `--hand right`, `--flip-input`, `--no-preview`, and `--web 8080` are passed to `hand_cam`. Give the camera as an index (`--camera 1`), not as `/dev/video1`: a path is opened as a video file.
+
+`--web 8080` also shows the preview in a web browser at `http://<machine-ip>:8080/`, with `O`/`F`/`R` as buttons and as keys on the page. It works in every build, including the headless riscv bundle and over ssh, with or without the preview window. The JPEG encoding runs on its own thread. The server listens on all network interfaces and has no password: anyone who reaches the port can watch the camera and send calibration keys. A browser on the board itself also takes CPU time from inference, so for a monitor on the board the native preview window is lighter.
+
 Controller options can be supplied with `CTRL_ARGS`, for example:
 ```bash
 DH116_IFACE=enp0s31f6 CTRL_ARGS="--current 300 --deadband 80" ./scripts/run.sh
@@ -123,6 +145,7 @@ Then run it with the same `run.sh` options as the native build:
 ```bash
 ./run.sh --dry-run --camera 0                          # camera and inference only; no EtherCAT
 DH116_IFACE=eth1 ./run.sh --camera 0 --hand left       # hardware run; root, or sudo for EtherCAT
+DH116_IFACE=eth1 ./run.sh --camera 0 --web 8080        # same, preview at http://<board-ip>:8080/
 ```
 
 To start the programs by hand instead:
@@ -140,7 +163,24 @@ To estimate inference time on any device before building anything, run `python3 
 
 `scripts/quantize_models.py --source <clip or images or camera index>` (dev host; needs `onnx`, `opencv-python-headless` too) writes int8 versions to `models/int8/` and reports accuracy against fp32. Time them on the device with `bench_models.py --model-dir models/int8`. To time the ONNX Runtime that `hand_cam` is actually linked against (e.g. the RVV build), run `./bin/hand_cam --bench --threads 8 [--model-dir models/int8]`; it needs no camera. This is experimental: with sample images only, the palm net still loses the hand in a fifth of frames and the landmark world error is ~5 mm, so calibrate on a real clip before trusting it.
 
-`./bin/hand_cam --camera 1 --profile` prints the average time per frame in each stage (camera wait, palm, landmark, draw+show) every 30 frames; use it to see where a slow live run loses its time.
+`--bench` prints the time of each network and a per-frame estimate: `steady` is a frame with the landmark net only, `spike` a frame that also runs the palm net, and `average` spreads the palm net over `--det-every` frames.
+
+`./bin/hand_cam --camera 1 --profile` prints the average time per frame in each stage every 30 frames; use it to see where a slow live run loses its time:
+
+- `wait-camera`: idle time waiting for a frame newer than the last one processed. Capture and MJPEG decoding run on their own thread, so this is not processing time; a large value means the program keeps up with the camera.
+- `detect`: from the new frame to the landmarks, including `--flip-input`, the colour conversion, and decoding the network outputs.
+- `palm`, `landmark`: the two networks, including the palm input resize and the landmark crop. The palm net runs every `--det-every` frames, and on every frame while no hand is tracked.
+- `draw+show`: the overlay, the mirrored preview window and its key handling, and handing the image to `--web`; 0 with `--no-preview` and no `--web`.
+
+Measured on the riscv64 board (SpacemiT X100 cores, `--threads 4`, USB camera with MJPEG 640x480 at 30 fps, its maximum):
+
+| Build | palm | landmark | Live |
+|---|---|---|---|
+| Static bundle (`build-riscv.sh`, RVV) | 33 ms | 14 ms | 30 fps with a hand (limited by the camera); ~27 fps with no hand, as the palm net then runs on every frame |
+| Native, ONNX Runtime without RVV kernels | 602 ms | 812 ms | under 1 fps |
+| Native `build.sh` (with `--enable_rvv`) | 28 ms | 14.5 ms | preview shows 33–35 fps; draw+show ~18 ms |
+
+The real frame rate cannot exceed the camera's, because each loop waits for a new frame. The FPS in the preview averages 1/frame-time, so it reads high when frame times vary.
 
 
 
@@ -154,6 +194,7 @@ To estimate inference time on any device before building anything, run `python3 
 | [cmake/toolchains/](cmake/toolchains/) | CMake toolchain file for the riscv64 build. |
 | [scripts/run.sh](scripts/run.sh) | Supervises the camera/controller processes; runs `scripts/build.sh` if needed; a copy also runs inside the riscv64 bundle. |
 | [src/hand_cam.cpp](src/hand_cam.cpp) | Camera capture, palm and landmark networks, preview, and UDP to the controller. |
+| [src/web_view.h](src/web_view.h) | `hand_cam --web`: the preview as an MJPEG stream for a web browser, and the calibration keys from it. |
 | [src/mimic_ctrl.c](src/mimic_ctrl.c) | Controller main loop: UDP from `hand_cam`, landmarks to targets, deadband, log line. |
 | [src/dh116.c](src/dh116.c), [include/dh116.h](include/dh116.h) | The hand on EtherCAT (SOEM): start-up, 10 ms cycle, frames sent to the hand, feedback, opening the fingers, shutdown. |
 | [src/hand_math.c](src/hand_math.c), [include/hand_math.h](include/hand_math.h) | Landmarks to finger closure, calibration file, One-Euro filter. |

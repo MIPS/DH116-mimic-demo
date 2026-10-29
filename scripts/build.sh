@@ -7,7 +7,7 @@ Usage: ./scripts/build.sh [options]
 
 Builds everything the demo needs:
   1. initializes the third_party submodules (SOEM, onnxruntime) when empty
-  2. builds ONNX Runtime from third_party/onnxruntime (first run only; slow)
+  2. builds ONNX Runtime from third_party/onnxruntime (first run only; slow; on riscv64 with RVV kernels)
   3. builds mimic_ctrl and hand_cam with CMake
 
 Works on the dev host and natively on the board. hand_cam gets the preview window unless --headless
@@ -215,8 +215,14 @@ clean_build_dirs() {
 }
 
 build_ort() {
-    local rev built
+    local rev built ort_args=()
     rev="$(git -C "$ORT_SRC" rev-parse HEAD 2>/dev/null || cat "$ORT_SRC/VERSION_NUMBER")"
+    # On riscv64 also build the RVV kernels; ONNX Runtime uses them only on cores that report V.
+    # The flag is part of the stamp, so a library built without it is rebuilt once.
+    if [[ "$(uname -m)" == riscv64 ]]; then
+        ort_args+=(--enable_rvv)
+        rev+=" rvv"
+    fi
 
     if ort_prefix_valid "$ORT_PREFIX" && [[ "$(cat "$ORT_PREFIX/.source-rev" 2>/dev/null || true)" == "$rev" ]]; then
         log "ONNX Runtime is already built: $ORT_PREFIX"
@@ -237,6 +243,7 @@ build_ort() {
         --compile_no_warning_as_error \
         --update --build \
         --target onnxruntime \
+        "${ort_args[@]}" \
         --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
 
     built="$ORT_BUILD_DIR/Release"

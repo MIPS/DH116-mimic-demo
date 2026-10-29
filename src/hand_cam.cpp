@@ -6,6 +6,7 @@
 // or when no hand is tracked; in between, the hand box comes from the previous frame's landmarks.
 //
 // Builds with HAND_CAM_HEADLESS use an OpenCV without highgui (no preview window) and always run as --no-preview.
+// --web PORT shows the same preview in a web browser (web_view.h), with or without the window.
 
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/opencv.hpp>
@@ -37,6 +38,7 @@
 #include <unistd.h>
 
 #include "mimic_msg.h"
+#include "web_view.h"
 
 constexpr int PALM_SIZE = 192;        // palm detector input, pixels
 constexpr int LM_SIZE = 224;          // landmark net input, pixels
@@ -89,6 +91,7 @@ struct Options
     std::string model_dir = "models";
     bool flip_input = false, no_preview = false, profile = false, bench = false;
     int frames = 0, threads = 8, det_every = 30, bench_iters = 100;
+    int web_port = 0; // --web: TCP port of the browser preview; 0 = off
 };
 
 void print_usage(const char* argv0)
@@ -102,6 +105,8 @@ void print_usage(const char* argv0)
               << "  --model-dir DIR     holds hand_palm.onnx and hand_landmark_detector.onnx (default models)\n"
               << "  --flip-input        mirror the camera image first (for cameras that deliver it mirrored)\n"
               << "  --no-preview        no preview window\n"
+              << "  --web PORT          also show the preview in a web browser at http://<this machine>:PORT/\n"
+              << "                      (open to the whole network, no password)\n"
               << "  --frames N          stop after N frames; 0 means unlimited\n"
               << "  --threads N         ONNX Runtime threads per model (default 8)\n"
               << "  --det-every N       run the palm detector every N frames (default 30)\n"
@@ -135,6 +140,7 @@ Options parse_args(int argc, char** argv)
         else if (arg == "--model-dir") o.model_dir = value();
         else if (arg == "--flip-input") o.flip_input = true;
         else if (arg == "--no-preview") o.no_preview = true;
+        else if (arg == "--web") o.web_port = std::stoi(value());
         else if (arg == "--frames") o.frames = std::stoi(value());
         else if (arg == "--threads") o.threads = std::stoi(value());
         else if (arg == "--det-every") o.det_every = std::stoi(value());
@@ -145,6 +151,7 @@ Options parse_args(int argc, char** argv)
     }
     if (o.hand != "left" && o.hand != "right") throw std::runtime_error("--hand must be left or right");
     if (o.port < 1 || o.port > 65535) throw std::runtime_error("--port must be 1..65535");
+    if (o.web_port < 0 || o.web_port > 65535) throw std::runtime_error("--web must be 1..65535");
     if (o.width <= 0 || o.height <= 0) throw std::runtime_error("--width and --height must be positive");
     if (o.frames < 0) throw std::runtime_error("--frames must not be negative");
     if (o.threads <= 0 || o.det_every <= 0 || o.bench_iters <= 0)
@@ -637,10 +644,13 @@ int run(const Options& opt)
     std::unique_ptr<Grabber> grabber; // cameras only; a video file is read frame by frame
     if (is_number(opt.camera)) grabber = std::make_unique<Grabber>(cap);
     Link link(opt.port);
+    std::unique_ptr<WebView> web; // --web only
+    if (opt.web_port) web = std::make_unique<WebView>(opt.web_port);
 
     const bool right = opt.hand == "right";
     std::cout << "Tracking your " << opt.hand << " hand -> mimic_ctrl on 127.0.0.1:" << opt.port << ". " << HELP
               << std::endl;
+    if (web) std::cout << "Preview for a web browser: http://<this machine>:" << opt.web_port << "/" << std::endl;
 
     uint64_t last_frame = 0;      // grabber frame number of the last frame used
     int frames = 0;               // frames processed
@@ -717,7 +727,8 @@ int run(const Options& opt)
 
             int key = -1;
             const double t_show = now_s();
-            if (!opt.no_preview)
+            const bool draw = !opt.no_preview || web;
+            if (draw)
             {
                 std::ostringstream top;
                 top << (right ? "RIGHT" : "LEFT") << " hand   " << std::fixed << std::setprecision(1) << fps
@@ -725,11 +736,20 @@ int run(const Options& opt)
                 std::string state = "No reply from mimic_ctrl on port " + std::to_string(opt.port);
                 if (alive) state = status->dry_run ? "DRY RUN (no EtherCAT)" : "hand RUNNING";
                 draw_preview(image, hands, selected, alive ? &*status : nullptr, {top.str(), state, message, HELP});
-                gui::show(image);
-                key = gui::wait_key();
+                if (web)
+                {
+                    web->publish(image);
+                    key = web->take_key();
+                }
+                if (!opt.no_preview)
+                {
+                    gui::show(image);
+                    const int window_key = gui::wait_key();
+                    if (key < 0) key = window_key;
+                }
             }
             if (opt.profile)
-                profile.add(t_got - t_loop, t_found - t_got, opt.no_preview ? 0 : now_s() - t_show, landmarker);
+                profile.add(t_got - t_loop, t_found - t_got, draw ? now_s() - t_show : 0, landmarker);
 
             if (key == 'q' || key == 27 || (!opt.no_preview && !gui::visible())) break;
             if (key == 'o') calibrate = MSG_CAL_OPEN;
