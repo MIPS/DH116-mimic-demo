@@ -7,6 +7,7 @@ Usage: ./scripts/run.sh [--dry-run] [camera options]
 
 Runs hand_cam (camera + neural nets) and mimic_ctrl (EtherCAT controller). Camera options
 are passed to hand_cam, for example: --hand right --camera 0 --flip-input --no-preview.
+--profile goes to both: hand_cam prints its stage times, mimic_ctrl logs the joint currents.
 
 If either executable is missing in the repository checkout, scripts/build.sh runs
 first. To rebuild after a source change, run scripts/build.sh yourself.
@@ -48,6 +49,7 @@ IFACE="${DH116_IFACE:-}"
 PORT="${MIMIC_PORT:-5006}"
 CAMERA="${DH116_CAMERA:-0}"
 DRY_RUN=0
+PROFILE=0
 CAMERA_ARGS=()
 CTRL_EXTRA=()
 
@@ -70,6 +72,11 @@ while (($#)); do
             (($# >= 2)) || die "--port requires a number"
             PORT="$2"
             shift 2
+            ;;
+        --profile)
+            PROFILE=1
+            CAMERA_ARGS+=("$1")
+            shift
             ;;
         --)
             shift
@@ -127,6 +134,9 @@ fi
 if [[ -n "${CTRL_ARGS:-}" ]]; then
     read -r -a CTRL_EXTRA <<< "$CTRL_ARGS"
 fi
+if (( PROFILE )); then
+    CTRL_EXTRA+=(--profile)
+fi
 
 if (( DRY_RUN )); then
     CTRL_CMD=("$CONTROLLER" --dry-run --port "$PORT" --calibration "$ROOT_DIR/hand_calibration.json" "${CTRL_EXTRA[@]}")
@@ -142,7 +152,7 @@ CAMERA_CMD=(
     --width 640
     --height 480
     --threads 4
-    --det-every 15
+    --det-every 30
     "${CAMERA_ARGS[@]}"
 )
 

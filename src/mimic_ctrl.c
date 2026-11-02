@@ -9,6 +9,7 @@
  *
  * Hand out of view or GUI silent: the hand holds its pose. Quit (GUI Q/Esc, Ctrl+C, SIGTERM): the hand
  * opens, the joints are disabled, the bus goes to INIT. Hand not answering: bus to INIT, exit code 2.
+ * A joint in alarm stop, emergency stop or no longer enabled: joints disabled without moving, exit code 3.
  */
 #include <errno.h>
 #include <math.h>
@@ -110,6 +111,7 @@ static int usage(const char *p)
            "  --calibration FILE (default hand_calibration.json)\n"
            "  --min-cutoff HZ    One-Euro filter minimum cutoff (default 1.0)\n"
            "  --beta B           One-Euro filter speed coefficient (default 1.0)\n"
+           "  --profile          also log each joint's current (per mille of the rated current)\n"
            "  --quiet            no log line every second\n",
            p, p, MSG_PORT);
     return 1;
@@ -120,9 +122,10 @@ int main(int argc, char **argv)
     static dh116 hand; /* static: the SOEM context is large */
     static ctrl c;
     const char *ifname = NULL, *cal_path = "hand_calibration.json";
-    int dry = 0, verbose = 1, port = MSG_PORT, current = 0, speed = 20000, deadband = 50;
+    int dry = 0, verbose = 1, profile = 0, port = MSG_PORT, current = 0, speed = 20000, deadband = 50;
     double min_cutoff = 1.0, beta = 1.0;
     unsigned moves = 0;
+    int fault = 0;
     char err[160], current_text[16];
     struct sockaddr_in addr;
     struct timespec last_log, now;
@@ -133,6 +136,7 @@ int main(int argc, char **argv)
         int has_value = i + 1 < argc;
         if (!strcmp(a, "--dry-run")) dry = 1;
         else if (!strcmp(a, "--quiet")) verbose = 0;
+        else if (!strcmp(a, "--profile")) profile = 1;
         else if (!strcmp(a, "--port") && has_value) port = atoi(argv[++i]);
         else if (!strcmp(a, "--current") && has_value) current = atoi(argv[++i]);
         else if (!strcmp(a, "--speed") && has_value) speed = atoi(argv[++i]);
@@ -192,6 +196,11 @@ int main(int argc, char **argv)
             moves++;
         }
         if (dh116_cycle(&hand)) return 2;
+        if (dh116_check_status(&hand))
+        {
+            fault = 1;
+            break;
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         double dt = (now.tv_sec - last_log.tv_sec) + (now.tv_nsec - last_log.tv_nsec) * 1e-9;
@@ -204,6 +213,13 @@ int main(int argc, char **argv)
             {
                 printf(" | measured:");
                 for (int j = 0; j < DH116_JOINTS; ++j) printf(" %5d", hand.measured[j]);
+                printf(" | status:");
+                for (int j = 0; j < DH116_JOINTS; ++j) printf(" %02x", hand.status[j]);
+                if (profile)
+                {
+                    printf(" | current:");
+                    for (int j = 0; j < DH116_JOINTS; ++j) printf(" %5d", hand.measured_current[j]);
+                }
             }
             printf("\n");
             fflush(stdout);
@@ -212,6 +228,14 @@ int main(int argc, char **argv)
         }
     }
 
+    if (fault)
+    {
+        /* A joint is in alarm, e-stop or lost its enable: do not drive it to open, just switch everything off. */
+        printf("stopping: joint fault, disabling the joints without moving the hand\n");
+        dh116_stop(&hand);
+        close(c.sock);
+        return 3;
+    }
     printf("stopping: %s\n", c.quit ? "GUI quit" : "signal");
     if (!dry) printf("opening the hand ...\n");
     if (dh116_open_fingers(&hand)) return 2;

@@ -22,6 +22,8 @@ The UDP messages are defined in [include/mimic_msg.h](include/mimic_msg.h). `han
 | the tracked hand leaves the camera view | holds its last pose |
 | `hand_cam` quits (Q/Esc) or `run.sh` gets Ctrl-C | `mimic_ctrl` opens the fingers, then disables the joints |
 | the EtherCAT cable is unplugged | `mimic_ctrl` stops after 100 ms without answers; the hand holds its last pose |
+| a joint reports alarm stop, emergency stop, or is no longer enabled | `mimic_ctrl` prints the joint in red, disables all joints without moving them, and exits with code 3 |
+| a joint reports a travel limit, homing, or torque reached (at its current limit, e.g. a finger pushing on something) for 100 ms | `mimic_ctrl` prints a yellow warning, and a line when it clears, and keeps going |
 
 Preview keys (in the window, or on the `--web` page): `O` calibrates the open hand, `F` the fist, `R` resets the calibration (deletes `hand_calibration.json`).
 
@@ -125,7 +127,9 @@ Controller options can be supplied with `CTRL_ARGS`, for example:
 ```bash
 DH116_IFACE=enp0s31f6 CTRL_ARGS="--current 300 --deadband 80" ./scripts/run.sh
 ```
-`mimic_ctrl` options: `--speed` (default 20000), `--current` (per mille; not sent by default, so the hand uses its own limit), `--deadband`, `--min-cutoff` and `--beta` (filter), `--quiet`. The once-per-second log line lists the targets and measured positions in finger order: thumb sweep, thumb bend, index, middle, ring, little.
+`mimic_ctrl` options: `--speed` (default 20000), `--current` (per mille; not sent by default, so the hand uses its own limit), `--deadband`, `--min-cutoff` and `--beta` (filter), `--profile`, `--quiet`. The once-per-second log line lists the targets, measured positions, and status bytes in finger order: thumb sweep, thumb bend, index, middle, ring, little. `--profile` adds each joint's current (per mille of the rated current); `./scripts/run.sh --profile` passes it to both programs.
+
+Each joint's status byte (protocol sheet, ECAT): bit 0 enabled, bit 1 position reached, bit 2 zero speed, bit 3 torque reached, bit 4 homing completed, bits 5-7 the state (0 stopped, 1 running, 2 alarm stop, 3 / 4 / 5 at the + / - / both limits, 6 emergency stop, 7 homing). A still hand shows `07`, a moving one `21` to `27`. At start-up `mimic_ctrl` prints the status bytes and how many joints are homed, and refuses to run if a joint is in alarm stop or emergency stop, or not enabled. While running, a joint line is printed only when its problem starts or ends, with the status byte and current: fatal ones in red at once, warnings in yellow once they last 100 ms (colours only on a terminal). Over EtherCAT the hand reports no fault details (such as under-voltage); the vendor tools show those. The hand's own protections (over/under-voltage, overcurrent, overload, stall, over-temperature) all show up here as alarm stop.
 
 The shared UDP port defaults to `5006` and can be changed with `MIMIC_PORT` or `--port`.
 
@@ -165,7 +169,7 @@ To estimate inference time on any device before building anything, run `python3 
 
 `--bench` prints the time of each network and a per-frame estimate: `steady` is a frame with the landmark net only, `spike` a frame that also runs the palm net, and `average` spreads the palm net over `--det-every` frames.
 
-`./bin/hand_cam --camera 1 --profile` prints the average time per frame in each stage every 30 frames; use it to see where a slow live run loses its time:
+`./bin/hand_cam --camera 1 --profile` prints the average time per frame in each stage every 30 frames (through `run.sh`, `--profile` also adds the joint currents to the `mimic_ctrl` log line); use it to see where a slow live run loses its time:
 
 - `wait-camera`: idle time waiting for a frame newer than the last one processed. Capture and MJPEG decoding run on their own thread, so this is not processing time; a large value means the program keeps up with the camera.
 - `detect`: from the new frame to the landmarks, including `--flip-input`, the colour conversion, and decoding the network outputs.
@@ -196,7 +200,7 @@ The real frame rate cannot exceed the camera's, because each loop waits for a ne
 | [src/hand_cam.cpp](src/hand_cam.cpp) | Camera capture, palm and landmark networks, preview, and UDP to the controller. |
 | [src/web_view.h](src/web_view.h) | `hand_cam --web`: the preview as an MJPEG stream for a web browser, and the calibration keys from it. |
 | [src/mimic_ctrl.c](src/mimic_ctrl.c) | Controller main loop: UDP from `hand_cam`, landmarks to targets, deadband, log line. |
-| [src/dh116.c](src/dh116.c), [include/dh116.h](include/dh116.h) | The hand on EtherCAT (SOEM): start-up, 10 ms cycle, frames sent to the hand, feedback, opening the fingers, shutdown. |
+| [src/dh116.c](src/dh116.c), [include/dh116.h](include/dh116.h) | The hand on EtherCAT (SOEM): start-up, 10 ms cycle, frames sent to the hand, feedback and joint status, opening the fingers, shutdown. |
 | [src/hand_math.c](src/hand_math.c), [include/hand_math.h](include/hand_math.h) | Landmarks to finger closure, calibration file, One-Euro filter. |
 | [include/mimic_msg.h](include/mimic_msg.h) | UDP messages between `hand_cam` and `mimic_ctrl`. |
 | [models/](models/) | Palm and hand-landmark ONNX models. |

@@ -6,30 +6,27 @@
  *   0x01  command:         per axis 2 bytes = mode, command
  *   0x05  data:            per axis 4 bytes = position, speed / 10
  *   0x0B  data:            per axis 6 bytes = position, speed / 10, current (per mille)
- * TPDO (192 bytes) frame type 0x00: per axis 6 bytes = position, speed, current.
+ * TPDO (192 bytes) frame type 0x00: per axis 6 bytes = position, speed, current; the status byte of axis k is at 164 + k.
  */
 #include "dh116.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Axis k of a frame is joint WIRE_JOINT[k]: the hand has the thumb bend before the thumb sweep.
  * Checked on our L1 hand; the joint table in the vendor library disagrees. */
 static const int WIRE_JOINT[DH116_JOINTS] = {1, 0, 2, 3, 4, 5};
+static const char *const JOINT_NAME[DH116_JOINTS] = {"thumb sweep", "thumb bend", "index", "middle", "ring", "little"};
 
 /* A command only takes effect when it differs from the previous one. */
-enum { CMD_IDLE = 0, CMD_ENABLE = 1, CMD_DISABLE = 2, CMD_MOVE = 8 /* "cancel e-stop" in the sheet */ };
-#define MODE_POSITION 0x20 /* as sent by the vendor library: position mode (bits 0-2 = 0), bit 5 unknown */
-
-/* Frames sent once after every target change, one per cycle; after them the data frame repeats.
- * Change this line for the hardware tests:
- *   {SEND_MOVE}               MOVE, then the new target (default)
- *   {SEND_TARGET, SEND_MOVE}  new target, MOVE, new target (the older, verified order)
- *   {SEND_TARGET}             no MOVE at all */
-enum { SEND_TARGET, SEND_MOVE };
-static const int AFTER_CHANGE[] = {SEND_MOVE};
-#define N_AFTER_CHANGE ((int)(sizeof(AFTER_CHANGE) / sizeof(AFTER_CHANGE[0])))
+enum { CMD_IDLE = 0, CMD_ENABLE = 1, CMD_DISABLE = 2 };
+/* Mode byte = motion mode (bits 0-2) | homing method << 3 | homing direction << 5 | bit 7. The vendor library sends
+ * position mode (0) with its default homing direction 1 (negative). Bit 7 = 0: a new target acts as soon as it
+ * arrives, so no extra command is needed per move. */
+#define MODE_POSITION 0x20
+#define TPDO_STATUS 164 /* status bytes follow 27 axis slots of 6 bytes: 2 + 27 * 6 */
 
 #define WKC_OK 3              /* working counter of a good cycle: the hand read its outputs and wrote its inputs */
 #define FAULT_MS 100          /* the hand not answering for this long is a fault */
@@ -44,6 +41,12 @@ static void put16(uint8_t *p, int v)
 }
 
 static int16_t get16(const uint8_t *p) { return (int16_t)(p[0] | (p[1] << 8)); }
+
+/* Colours for fault lines, only when the output goes to a terminal. */
+#define RED "\033[1;31m"
+#define YELLOW "\033[33m"
+#define NO_COLOR "\033[0m"
+static const char *color(FILE *f, const char *code) { return isatty(fileno(f)) ? code : ""; }
 
 /* ---------------------------------------------------------------- frames */
 
@@ -87,12 +90,17 @@ static void frame_data(dh116 *h)
     }
 }
 
-/* Joint feedback (TPDO frame type 0x00); only the position is used. */
+/* Joint feedback (TPDO frame type 0x00): position, current and status byte of each axis. */
 static void read_feedback(dh116 *h, const uint8_t *in)
 {
     int n = in[1] < DH116_JOINTS ? in[1] : DH116_JOINTS;
     if (in[0] != 0x00) return;
-    for (int k = 0; k < n; ++k) h->measured[WIRE_JOINT[k]] = get16(in + 2 + 6 * k);
+    for (int k = 0; k < n; ++k)
+    {
+        h->measured[WIRE_JOINT[k]] = get16(in + 2 + 6 * k);
+        h->measured_current[WIRE_JOINT[k]] = get16(in + 6 + 6 * k);
+        h->status[WIRE_JOINT[k]] = in[TPDO_STATUS + k];
+    }
     if (n > 0) h->got_feedback = 1;
 }
 
@@ -136,8 +144,8 @@ static int exchange(dh116 *h, const uint8_t f[DH116_RPDO_BYTES])
         }
         else if (++h->missed_cycles >= FAULT_MS / DH116_CYCLE_MS)
         {
-            fprintf(stderr, "FAULT: hand not answering for %d ms (working counter below %d). Bus -> INIT.\n",
-                    FAULT_MS, WKC_OK);
+            fprintf(stderr, "%sFAULT: hand not answering for %d ms (working counter below %d). Bus -> INIT.%s\n",
+                    color(stderr, RED), FAULT_MS, WKC_OK, color(stderr, NO_COLOR));
             go_init_and_close(h);
             return -1;
         }
@@ -154,7 +162,58 @@ static int hold(dh116 *h, const uint8_t f[DH116_RPDO_BYTES], int ms)
     return 0;
 }
 
+/* Problem of one joint: 0 = none, else its state (DH116_ALARM .. DH116_HOMING), NOT_ENABLED or TORQUE_LIMIT.
+ * Stopped/running and the other flag bits change all the time during normal motion, so they are not problems. */
+#define NOT_ENABLED 8
+#define TORQUE_LIMIT 9
+static int problem(uint8_t status)
+{
+    int state = DH116_ST_STATE(status);
+    if (state >= DH116_ALARM) return state;
+    if (!(status & DH116_ST_ENABLED)) return NOT_ENABLED;
+    return (status & DH116_ST_TORQUE) ? TORQUE_LIMIT : 0;
+}
+
+/* Fatal problems stop the hand; the others are warnings. */
+static int is_fatal(int p) { return p == DH116_ALARM || p == DH116_ESTOP || p == NOT_ENABLED; }
+
 /* ---------------------------------------------------------------- public */
+
+#define ENABLE_MIN_MS 200 /* the first status after the enable command is not trusted before this */
+#define ENABLE_WAIT_MS 800 /* wait this long for every joint to report enabled, per attempt */
+
+static int all_enabled(const dh116 *h)
+{
+    for (int j = 0; j < DH116_JOINTS; ++j)
+        if (!(h->status[j] & DH116_ST_ENABLED)) return 0;
+    return h->got_feedback;
+}
+
+/* Enable all joints through idle (commands act only on a change) and wait until the status bytes say so. The hand can
+ * need longer than a fixed delay, or ignore the first enable after an aborted run: the second attempt sends disable
+ * first. Returns 0 when every joint is enabled, 1 when not (the caller reports the status), -1 = hand lost. */
+static int enable_joints(dh116 *h)
+{
+    uint8_t f[DH116_RPDO_BYTES];
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        if (attempt)
+        {
+            printf("not enabled yet, sending disable and enable again ... ");
+            frame_command(f, CMD_DISABLE);
+            if (hold(h, f, 100)) return -1;
+        }
+        frame_command(f, CMD_IDLE);
+        if (hold(h, f, 100)) return -1;
+        frame_command(f, CMD_ENABLE);
+        for (int ms = 0; ms < ENABLE_WAIT_MS; ms += DH116_CYCLE_MS)
+        {
+            if (exchange(h, f)) return -1;
+            if (ms >= ENABLE_MIN_MS && all_enabled(h)) return 0;
+        }
+    }
+    return 1;
+}
 
 int dh116_start(dh116 *h, const char *ifname, int speed, int current)
 {
@@ -166,7 +225,6 @@ int dh116_start(dh116 *h, const char *ifname, int speed, int current)
     hand = &ctx->slavelist[1];
     h->speed = speed;
     h->current = current;
-    h->step = N_AFTER_CHANGE; /* nothing to send until the first target change */
     clock_gettime(CLOCK_MONOTONIC, &h->next_cycle);
     if (!ifname)
     {
@@ -219,10 +277,7 @@ int dh116_start(dh116 *h, const char *ifname, int speed, int current)
     if (hold(h, f, 250)) return -1;
     frame_select_feedback(f);
     if (hold(h, f, 500)) return -1;
-    frame_command(f, CMD_IDLE);
-    if (hold(h, f, 100)) return -1;
-    frame_command(f, CMD_ENABLE);
-    if (hold(h, f, 200)) return -1;
+    if (enable_joints(h) < 0) return -1;
 
     if (!h->got_feedback)
     {
@@ -230,11 +285,19 @@ int dh116_start(dh116 *h, const char *ifname, int speed, int current)
         dh116_stop(h);
         return -1;
     }
-    printf("OP, joints enabled, feedback ok\n");
+    int homed = 0;
+    for (int j = 0; j < DH116_JOINTS; ++j) homed += (h->status[j] & DH116_ST_HOMED) != 0;
+    printf("OP, joints enabled, feedback ok, %d of 6 homed, status %02x %02x %02x %02x %02x %02x\n", homed,
+           h->status[0], h->status[1], h->status[2], h->status[3], h->status[4], h->status[5]);
+    if (dh116_check_status(h))
+    {
+        printf("bus: joint fault at start-up, refusing to move\n");
+        dh116_stop(h);
+        return -1;
+    }
 
-    /* Hold the pose the hand is in now. That is not a change, so no MOVE. */
+    /* Hold the pose the hand is in now. */
     dh116_set_target(h, h->measured);
-    h->step = N_AFTER_CHANGE;
     return 0;
 }
 
@@ -243,19 +306,46 @@ void dh116_set_target(dh116 *h, const int pos[DH116_JOINTS])
     for (int j = 0; j < DH116_JOINTS; ++j)
         h->target[j] = pos[j] < 0 ? 0 : pos[j] > DH116_POS_MAX ? DH116_POS_MAX : pos[j];
     frame_data(h);
-    h->step = 0; /* send the AFTER_CHANGE frames first */
 }
 
 int dh116_cycle(dh116 *h)
 {
-    uint8_t move[DH116_RPDO_BYTES];
-    int send = h->step < N_AFTER_CHANGE ? AFTER_CHANGE[h->step++] : SEND_TARGET;
-    if (send == SEND_MOVE)
-    {
-        frame_command(move, CMD_MOVE);
-        return exchange(h, move);
-    }
     return exchange(h, h->data);
+}
+
+#define WARN_AFTER_CYCLES 10 /* 100 ms: a warning must last this long, so short blips during fast moves stay quiet */
+
+int dh116_check_status(dh116 *h)
+{
+    static const char *const TEXT[] = {
+        [0] = "back to normal",
+        [DH116_ALARM] = "ALARM STOP",
+        [DH116_LIMIT_POS] = "at + limit",
+        [DH116_LIMIT_NEG] = "at - limit",
+        [DH116_LIMIT_BOTH] = "at both limits",
+        [DH116_ESTOP] = "EMERGENCY STOP",
+        [DH116_HOMING] = "homing",
+        [NOT_ENABLED] = "NOT ENABLED",
+        [TORQUE_LIMIT] = "at current limit (torque reached)",
+    };
+
+    int any_fatal = 0;
+    if (h->dry) return 0;
+    for (int j = 0; j < DH116_JOINTS; ++j)
+    {
+        int p = problem(h->status[j]), fatal = is_fatal(p);
+        any_fatal |= fatal;
+        if (p == h->problem[j]) h->settle[j] = 0;
+        else if (fatal || ++h->settle[j] >= WARN_AFTER_CYCLES)
+        {
+            printf("%sjoint %d (%s): %s (status 0x%02x, current %d)%s\n", color(stdout, fatal ? RED : p ? YELLOW : ""),
+                   j + 1, JOINT_NAME[j], TEXT[p], h->status[j], h->measured_current[j], color(stdout, NO_COLOR));
+            fflush(stdout);
+            h->problem[j] = (uint8_t)p;
+            h->settle[j] = 0;
+        }
+    }
+    return any_fatal ? -1 : 0;
 }
 
 int dh116_open_fingers(dh116 *h)

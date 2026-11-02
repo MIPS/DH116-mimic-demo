@@ -5,6 +5,7 @@ cmake-build*/
 CMakeUserPresets.json
 *.md
 !README.md
+hand_calibration.json
 
 # CMake caches and generated build-system files (including in-source builds).
 CMakeCache.txt
