@@ -6,6 +6,9 @@ CMakeUserPresets.json
 *.md
 !README.md
 hand_calibration.json
+models/*
+!models/*.onnx
+!models/README.md
 
 # CMake caches and generated build-system files (including in-source builds).
 CMakeCache.txt
@@ -38,3 +41,11 @@ compile_commands.json
 /mimic_ctrl
 /hand_cam
 trash/
+# Python test toolkit (test/dh116py): virtualenv, caches and run output (pcapng, csv, plots).
+/test/.venv/
+/test/runs/
+__pycache__/
+.pytest_cache/
+
+# Downloaded evaluation datasets (scripts/eval_hand_models.py).
+datasets/

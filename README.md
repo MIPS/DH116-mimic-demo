@@ -117,11 +117,28 @@ ORT_MLAS_RISCV_FORCE_SCALAR=1 build/native/hand_cam --bench --threads 4 --model-
 
 ## Run
 
-`run.sh` starts the controller and the camera program and stops both when either exits. It builds first only if an executable is missing.
+`run.sh` starts the controller and the camera program and stops both when either exits. It builds first only if an executable is missing. `./scripts/run.sh --help` prints the same cheat-sheet:
+
+| I want to | Command |
+|---|---|
+| test camera and inference, no robot | `./scripts/run.sh --dry-run` |
+| drive the hand | `DH116_IFACE=enp0s31f6 ./scripts/run.sh` |
+| use another camera or UDP port | `--camera 1`, `--port 5007` |
+| lower the camera frame rate | `--fps 15` (default 30; the camera driver may ignore it) |
+| use other models | `--palm-model FILE --landmark-model FILE` (input size is read from the model), or `--model-dir DIR` for `hand_palm.onnx` and `hand_landmark_detector.onnx` |
+| change speed, current, deadband | `CTRL_ARGS="--current 300 --deadband 80"` (see below) |
+| see the preview in a browser | `--web 8080` |
+| one image per button press, not real time | `--web 8080 --snapshot` |
+
+Options that `run.sh` does not know are passed to `hand_cam`. `run.sh` itself starts it with `--width 640 --height 480 --threads 4 --det-every 30 --model-dir models`; repeat any of them to override (the last value wins).
 
 Camera options such as `--camera 1`, `--hand right`, `--flip-input`, `--no-preview`, and `--web 8080` are passed to `hand_cam`. Give the camera as an index (`--camera 1`), not as `/dev/video1`: a path is opened as a video file.
 
 `--web 8080` also shows the preview in a web browser at `http://<machine-ip>:8080/`, with `O`/`F`/`R` as buttons and as keys on the page. It works in every build, including the headless riscv bundle and over ssh, with or without the preview window. The JPEG encoding runs on its own thread. The server listens on all network interfaces and has no password: anyone who reaches the port can watch the camera and send calibration keys. A browser on the board itself also takes CPU time from inference, so for a monitor on the board the native preview window is lighter.
+
+`--web 8080 --snapshot` is the not-real-time mode (`--snapshot` needs `--web`). The page shows the live camera next to the last capture, with a **Capture** button. One press takes the newest camera frame and runs the palm detector and the landmark net on it once; the status line flashes "Inferencing..." until they are done. If no hand of the `--hand` side is found, the page says so and nothing is sent. Otherwise the landmarks are drawn on the captured image, and one command goes to `mimic_ctrl` (after a message with no hand, so that its filter starts afresh and the command is the pose of this image, not blended with the last one). The button stays locked until the fingers have reached their targets, plus 2 s, so one press moves the hand once. A second press, or another browser, while a capture is in progress is refused. While it waits, `hand_cam` sends status requests every 100 ms; they move nothing. The waits are bounded: 1 s for `mimic_ctrl` to answer at all, 6 s for the fingers to arrive (then the page says they did not), each followed by the 2 s. A dry run reports no finger positions (and neither does a hand without position feedback), so there is nothing to wait for and the button unlocks 2 s after `mimic_ctrl` confirmed the command.
+
+There are no `O`/`F`/`R` keys in this mode: `mimic_ctrl` keeps the calibration it loaded, which is `hand_calibration.json` if that file exists, else the built-in defaults. To force the defaults, give `mimic_ctrl` a file that does not exist, for example `DH116_IFACE=enp0s31f6 CTRL_ARGS="--calibration none.json" ./scripts/run.sh --web 8080 --snapshot`; the last `--calibration` wins and the file is not created. `--frames`, `--det-every`, `--freeze-crop` and `--profile` have no effect here. The security note above applies even more: anyone who reaches the port can press Capture and so move the hand.
 
 Controller options can be supplied with `CTRL_ARGS`, for example:
 ```bash
@@ -161,11 +178,13 @@ To start the programs by hand instead:
 sudo ./bin/mimic_ctrl eth1 --calibration hand_calibration.json      # hardware; instead of --dry-run
 ```
 
-`--model-dir` is the directory that holds `hand_palm.onnx` and `hand_landmark_detector.onnx` (default `models`). Lower `--width`, `--height`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
+`--model-dir` is the directory that holds `hand_palm.onnx` and `hand_landmark_detector.onnx` (default `models`); `--palm-model` and `--landmark-model` name the two files directly. Float models and the Qualcomm w8a8 (uint8) models in `models/Qualcomm-w8a8/` both work; the uint8 models' quantisation constants are fixed in `hand_cam.cpp` (they come from that folder's `metadata.json`). `--freeze-crop F` (default 0.03) keeps the hand crop while the hand box moves less than F of its size, so a still hand is cropped the same way every frame and stays steady; `--freeze-crop 0` re-crops every frame. Lower `--width`, `--height`, `--fps`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
 
 To estimate inference time on any device before building anything, run `python3 scripts/bench_models.py` (needs only `pip install onnxruntime numpy`). It times both networks for several thread counts and prints the expected per-frame model cost; `--threads 1,2,4,8` sweeps counts and `taskset -c ...` pins it to chosen cores.
 
-`scripts/quantize_models.py --source <clip or images or camera index>` (dev host; needs `onnx`, `opencv-python-headless` too) writes int8 versions to `models/int8/` and reports accuracy against fp32. Time them on the device with `bench_models.py --model-dir models/int8`. To time the ONNX Runtime that `hand_cam` is actually linked against (e.g. the RVV build), run `./bin/hand_cam --bench --threads 8 [--model-dir models/int8]`; it needs no camera. This is experimental: with sample images only, the palm net still loses the hand in a fifth of frames and the landmark world error is ~5 mm, so calibrate on a real clip before trusting it.
+`scripts/quantize_models.py --source <clip or images or camera index>` (dev host; needs `onnx`, `opencv-python-headless` too) writes int8 versions to `models/int8/` and reports accuracy against fp32. Time them on the device with `bench_models.py --model-dir models/int8`. To time the ONNX Runtime that `hand_cam` is actually linked against (e.g. the RVV build), run `./bin/hand_cam --bench --threads 8 [--model-dir models/int8]`; it needs no camera. This is experimental: with sample images only, the palm net still loses the hand in a fifth of frames and the landmark world error is ~5 mm, so calibrate on a real clip before trusting it. 8-bit activations make the landmarks noisy frame to frame, so the robot fingers jitter on a still hand; `--act u16` (w8a16, output heads kept fp32 by default) avoids that: `scripts/quantize_models.py --source ... --act u16 --out-dir models/custom`, then `hand_cam --model-dir models/custom`. `--float-ops`, `--float-nodes`, `--quant-ops`, `--weights`, `--calibrate` and `--list-nodes` choose what is quantized and how; see `quant_comparison.md`. Re-calibrate the hand (open/fist) after switching models.
+
+To compare the accuracy of float and quantized models on a public hand dataset, run `python3 scripts/eval_hand_models.py` (needs `pip install numpy opencv-python onnxruntime`). On first use it downloads the FreiHAND evaluation set (3,960 images with ground-truth joints, about 760 MB) to `datasets/`, then scores the palm detector, the landmark net and the whole palm-to-landmark pipeline for every folder in `models/` that has a palm and a landmark `.onnx` (including the Qualcomm uint8 export). Pass folders explicitly (`models/default models/int8`), use `--limit`/`--stride` for a quick run, and `--json out.json` to save the numbers; `--help` explains each metric.
 
 `--bench` prints the time of each network and a per-frame estimate: `steady` is a frame with the landmark net only, `spike` a frame that also runs the palm net, and `average` spreads the palm net over `--det-every` frames.
 
@@ -197,8 +216,8 @@ The real frame rate cannot exceed the camera's, because each loop waits for a ne
 | [scripts/build-riscv.sh](scripts/build-riscv.sh) | Cross-builds the static riscv64 (RVA23) bundle. |
 | [cmake/toolchains/](cmake/toolchains/) | CMake toolchain file for the riscv64 build. |
 | [scripts/run.sh](scripts/run.sh) | Supervises the camera/controller processes; runs `scripts/build.sh` if needed; a copy also runs inside the riscv64 bundle. |
-| [src/hand_cam.cpp](src/hand_cam.cpp) | Camera capture, palm and landmark networks, preview, and UDP to the controller. |
-| [src/web_view.h](src/web_view.h) | `hand_cam --web`: the preview as an MJPEG stream for a web browser, and the calibration keys from it. |
+| [src/hand_cam.cpp](src/hand_cam.cpp) | Camera capture, palm and landmark networks, preview, and UDP to the controller; `--snapshot` runs one capture and one command per button press. |
+| [include/web_view.h](include/web_view.h) | `hand_cam --web`: the preview as an MJPEG stream for a web browser, and the calibration keys from it; with `--snapshot`, the Capture page and the state of the capture instead. |
 | [src/mimic_ctrl.c](src/mimic_ctrl.c) | Controller main loop: UDP from `hand_cam`, landmarks to targets, deadband, log line. |
 | [src/dh116.c](src/dh116.c), [include/dh116.h](include/dh116.h) | The hand on EtherCAT (SOEM): start-up, 10 ms cycle, frames sent to the hand, feedback and joint status, opening the fingers, shutdown. |
 | [src/hand_math.c](src/hand_math.c), [include/hand_math.h](include/hand_math.h) | Landmarks to finger closure, calibration file, One-Euro filter. |

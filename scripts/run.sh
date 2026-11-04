@@ -3,26 +3,34 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/run.sh [--dry-run] [camera options]
+Usage: ./scripts/run.sh [--dry-run] [--camera N] [--port N] [hand_cam options]
 
-Runs hand_cam (camera + neural nets) and mimic_ctrl (EtherCAT controller). Camera options
-are passed to hand_cam, for example: --hand right --camera 0 --flip-input --no-preview.
---profile goes to both: hand_cam prints its stage times, mimic_ctrl logs the joint currents.
+Starts mimic_ctrl (EtherCAT controller) and hand_cam (camera + neural nets) together;
+when either one exits, the other is stopped.
 
-If either executable is missing in the repository checkout, scripts/build.sh runs
-first. To rebuild after a source change, run scripts/build.sh yourself.
+Examples:
+  ./scripts/run.sh --dry-run                       camera and inference only, no EtherCAT, no sudo
+  DH116_IFACE=enp0s31f6 ./scripts/run.sh           drive the hand (see `ip -brief link`)
+  ./scripts/run.sh --dry-run --fps 15 --web 8080   any other option goes to hand_cam (see hand_cam --help)
+  ./scripts/run.sh --dry-run --web 8080 --snapshot not real time: one image per Capture press
+  ./scripts/run.sh --dry-run --palm-model a.onnx --landmark-model b.onnx
 
-Inside a riscv64 bundle the executables come from bin/ and nothing is built.
+Options (everything else is passed to hand_cam):
+  --dry-run            no EtherCAT
+  --camera N           camera index (default 0), same as DH116_CAMERA
+  --port N             UDP port shared by both programs (default 5006), same as MIMIC_PORT
+  --profile            goes to both: hand_cam prints its stage times, mimic_ctrl logs the joint currents
+
+run.sh starts hand_cam with --width 640 --height 480 --threads 4 --det-every 30 --model-dir <repo>/models.
+Repeat any of these in your options to change it: the last value wins.
 
 Environment:
-  DH116_IFACE          EtherCAT interface; required unless --dry-run (e.g. enp0s31f6)
-  DH116_CAMERA         Default camera source (default: 0)
-  MIMIC_PORT           UDP port shared by both processes (default: 5006)
+  DH116_IFACE          EtherCAT interface; required unless --dry-run
   CTRL_ARGS            Extra mimic_ctrl arguments, e.g. "--current 300 --deadband 80"
   DH116_BUILD_ROOT     Build root shared with build.sh (default: <repo>/build)
 
-Build options such as DH116_BUILD_TYPE and ONNXRUNTIME_ROOT are read by
-scripts/build.sh; see scripts/build.sh --help.
+If an executable is missing, scripts/build.sh runs first; after a source change, run it yourself.
+Inside a riscv64 bundle the executables come from bin/ and nothing is built.
 EOF
 }
 
@@ -32,7 +40,7 @@ die() {
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BUNDLE=0
+BUNDLE=0 # 1 inside the riscv64 tarball, where run.sh sits next to bin/ instead of in scripts/
 if [[ -f "$SCRIPT_DIR/../CMakeLists.txt" ]]; then
     ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 else
@@ -144,6 +152,7 @@ else
     CTRL_CMD=("${SUDO[@]}" "$CONTROLLER" "$IFACE" --port "$PORT" --calibration "$ROOT_DIR/hand_calibration.json" "${CTRL_EXTRA[@]}")
 fi
 
+# Defaults first, user options last: the last value of a repeated option wins.
 CAMERA_CMD=(
     "$CAMERA_APP"
     --camera "$CAMERA"
