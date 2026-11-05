@@ -376,7 +376,7 @@ make_bundle() {
 
     cp "$REPO_ROOT/hand_calibration.json" "$SCRIPT_DIR/run.sh" "$BUNDLE/"
     if ((! CONTROLLER_ONLY)); then
-        cp "$REPO_ROOT"/models/hand_palm.onnx "$REPO_ROOT"/models/hand_landmark_detector.onnx "$BUNDLE/models/"
+        cp "$REPO_ROOT"/models/palm.onnx "$REPO_ROOT"/models/landmark.onnx "$BUNDLE/models/"
     fi
 
     tar -C "$DIST" -czf "$BUNDLE.tar.gz" "$BUNDLE_NAME"

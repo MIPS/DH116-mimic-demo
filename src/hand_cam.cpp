@@ -8,7 +8,8 @@
 // Builds with HAND_CAM_HEADLESS use an OpenCV without highgui (no preview window) and always run as --no-preview.
 // --web PORT shows the same preview in a web browser (web_view.h), with or without the window.
 // --snapshot (with --web) is not real time: the browser shows the live camera, and each press of its Capture button
-// runs the nets once on that frame and sends one command to mimic_ctrl.
+// runs the nets once on that frame and sends one command to mimic_ctrl. With --camera browser the camera is the
+// browser's own (a laptop's webcam, say): each press uploads one picture, and this machine needs no camera.
 
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/opencv.hpp>
@@ -60,6 +61,7 @@ constexpr double SNAPSHOT_REACH_TIMEOUT = 6.0; // stop waiting for the hand to a
 constexpr double SNAPSHOT_SETTLE = 2.0;        // safety pause between the hand arriving and the next capture
 constexpr int SNAPSHOT_REACH_TOLERANCE = 150;  // raw position error that counts as arrived (OPEN_TOLERANCE in dh116.c)
 constexpr int SNAPSHOT_REACH_POLLS = 2;        // status replies in a row within the tolerance
+constexpr int SNAPSHOT_BROWSER_POLL_MS = 10;   // --camera browser: pause between looks for a press and for replies
 
 const char* const JOINT_NAMES[6] = {"Thumb sweep", "Thumb bend", "Index", "Middle", "Ring", "Little"};
 
@@ -93,7 +95,7 @@ double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock:
 
 struct Options
 {
-    std::string camera = "0"; // camera index or video file
+    std::string camera = "0"; // camera index, video file, or "browser" (--snapshot: the pictures come from the web page)
     int width = 320, height = 240;
     std::string hand = "left";
     int port = MSG_PORT;
@@ -106,6 +108,8 @@ struct Options
     int web_port = 0; // --web: TCP port of the browser preview; 0 = off
     bool snapshot = false; // --snapshot: one capture and one command per button press in the browser
 
+    bool browser_camera() const { return camera == "browser"; }
+
     std::string palm_path() const { return palm_model.empty() ? model_dir + "/palm.onnx" : palm_model; }
     std::string landmark_path() const
     {
@@ -116,15 +120,16 @@ struct Options
 void print_usage(const char* argv0)
 {
     std::cout << "Usage: " << argv0 << " [options]\n\n"
-              << "  --camera SOURCE     camera index or video file (default 0)\n"
-              << "  --width N           camera width (default 320)\n"
+              << "  --camera SOURCE     camera index, video file, or browser (default 0). browser: the camera of the\n"
+              << "                      computer whose browser opens the --web page; needs --snapshot (see --snapshot)\n"
+              << "  --width N           camera width (default 320); the size asked of the browser's camera too\n"
               << "  --height N          camera height (default 240)\n"
               << "  --fps N             frame rate requested from the camera (default 30; the driver may ignore it)\n"
               << "  --hand left|right   hand to track (default left)\n"
               << "  --port N            mimic_ctrl UDP port (default " << MSG_PORT << ")\n"
               << "  --model-dir DIR     holds palm.onnx and landmark.onnx (default models)\n"
               << "  --palm-model FILE   palm detector, instead of DIR/palm.onnx\n"
-              << "  --landmark-model FILE  landmark net, instead of DIR/landmarks.onnx\n"
+              << "  --landmark-model FILE  landmark net, instead of DIR/landmark.onnx\n"
               << "                      (the input size of both is read from the model; it must be square)\n"
               << "  --flip-input        mirror the camera image first (for cameras that deliver it mirrored)\n"
               << "  --no-preview        no preview window\n"
@@ -135,6 +140,10 @@ void print_usage(const char* argv0)
               << "                      hand; the button unlocks once the hand has arrived, plus " << SNAPSHOT_SETTLE << " s.\n"
               << "                      No O/F/R keys: mimic_ctrl keeps its saved or default calibration.\n"
               << "                      --frames, --det-every, --freeze-crop and --profile do not apply\n"
+              << "                      With --camera browser each press sends one picture from the browser's camera. A\n"
+              << "                      browser allows its camera only on https:// or http://localhost, so on the computer\n"
+              << "                      with the camera run: ssh -L PORT:localhost:PORT USER@<this machine>, and open\n"
+              << "                      http://localhost:PORT/\n"
               << "  --frames N          stop after N frames; 0 means unlimited\n"
               << "  --threads N         ONNX Runtime threads per model (default 8)\n"
               << "  --det-every N       run the palm detector every N frames (default 30)\n"
@@ -188,6 +197,8 @@ Options parse_args(int argc, char** argv)
     if (o.port < 1 || o.port > 65535) throw std::runtime_error("--port must be 1..65535");
     if (o.web_port < 0 || o.web_port > 65535) throw std::runtime_error("--web must be 1..65535");
     if (o.snapshot && !o.web_port) throw std::runtime_error("--snapshot needs --web PORT (the Capture button is on the web page)");
+    if (o.browser_camera() && !o.snapshot && !o.bench)
+        throw std::runtime_error("--camera browser needs --snapshot and --web PORT (the pictures come from the web page)");
     if (o.width <= 0 || o.height <= 0 || o.fps <= 0)
         throw std::runtime_error("--width, --height and --fps must be positive");
     if (o.frames < 0) throw std::runtime_error("--frames must not be negative");
@@ -1009,15 +1020,24 @@ int run_snapshot(const Options& opt)
 {
     // Palm detector on every capture, no crop freezing: nothing is carried over from the previous capture.
     HandLandmarker landmarker(opt.palm_path(), opt.landmark_path(), opt.threads, 1, 0);
-    cv::VideoCapture cap = open_camera(opt);
+    const bool browser = opt.browser_camera(); // the pictures come with the button presses; nothing to open here
+    cv::VideoCapture cap = browser ? cv::VideoCapture() : open_camera(opt);
     std::unique_ptr<Grabber> grabber; // cameras only; a video file is read in this loop and played again at its end
     if (is_number(opt.camera)) grabber = std::make_unique<Grabber>(cap);
     Link link(opt.port);
-    WebView web(opt.web_port, true);
+    WebView web(opt.web_port, true, browser ? opt.width : 0, browser ? opt.height : 0);
 
     const bool right = opt.hand == "right";
-    std::cout << "Snapshot mode: tracking your " << opt.hand << " hand -> mimic_ctrl on 127.0.0.1:" << opt.port << ".\n"
-              << "Open http://<this machine>:" << opt.web_port << "/ and press Capture." << std::endl;
+    std::cout << "Snapshot mode: tracking your " << opt.hand << " hand -> mimic_ctrl on 127.0.0.1:" << opt.port << ".\n";
+    if (browser)
+    {
+        const std::string port = std::to_string(opt.web_port);
+        std::cout << "The camera is the one of the computer whose browser opens the page. A browser allows its camera only\n"
+                  << "on https:// or http://localhost, so on that computer run:\n"
+                  << "    ssh -L " << port << ":localhost:" << port << " <user>@<this machine>\n"
+                  << "and open http://localhost:" << port << "/ and press Capture." << std::endl;
+    }
+    else std::cout << "Open http://<this machine>:" << opt.web_port << "/ and press Capture." << std::endl;
 
     enum class Phase { Live, Ack, Reach, Settle };
     Phase phase = Phase::Live;
@@ -1076,7 +1096,12 @@ int run_snapshot(const Options& opt)
         {
             cv::Mat image;
             double stamp;
-            if (grabber)
+            if (browser)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(SNAPSHOT_BROWSER_POLL_MS));
+                stamp = now_s();
+            }
+            else if (grabber)
             {
                 const Grabber::Frame frame = grabber->next(last_frame);
                 if (frame.count == last_frame) continue; // no new frame within 1 s
@@ -1093,16 +1118,24 @@ int run_snapshot(const Options& opt)
                     throw std::runtime_error("could not read the video file");
                 stamp = now_s();
             }
-            if (opt.flip_input) cv::flip(image, image, 1);
-
-            cv::Mat live;
-            cv::flip(image, live, 1); // mirror view, like the preview
-            web.publish(live);
+            if (!browser)
+            {
+                if (opt.flip_input) cv::flip(image, image, 1);
+                cv::Mat live;
+                cv::flip(image, live, 1); // mirror view, like the preview
+                web.publish(live);
+            }
             const double now = now_s();
 
             if (phase == Phase::Live)
             {
-                if (!web.take_capture()) continue;
+                if (browser)
+                {
+                    if (!web.take_capture(&image)) continue;
+                    if (opt.flip_input) cv::flip(image, image, 1);
+                    stamp = now;
+                }
+                else if (!web.take_capture()) continue;
                 ++captures;
                 shot = image.clone();
                 hands.clear();

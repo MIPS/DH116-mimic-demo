@@ -9,16 +9,23 @@
 //   POST /capture the Capture button: asks the main loop for one capture; 409 while the last one is not finished
 //   GET /state    JSON for the page: whether Capture can be pressed, a status text, the number of the last result
 //   GET /shot.jpg the result of the last capture
+// WebView(port, true, width, height) is the snapshot mode with the camera of the browser (hand_cam --camera browser):
+// the page shows that camera, asked for at width x height, instead of /stream, and each press of Capture sends the
+// picture it took as a JPEG in the body of POST /capture. The server decodes it for the main loop (take_capture).
 // It listens on all network interfaces without a password: anyone who reaches the port can watch and send keys
-// (in snapshot mode: press Capture, which moves the hand).
+// (in snapshot mode: press Capture, which moves the hand; with the browser camera: choose the picture it moves for).
 #pragma once
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -36,7 +43,9 @@
 class WebView
 {
 public:
-    explicit WebView(int port, bool snapshot = false) : snapshot_(snapshot)
+    // camera_width > 0 (snapshot mode only): the pictures come from the browser's camera, not from this machine.
+    explicit WebView(int port, bool snapshot = false, int camera_width = 0, int camera_height = 0)
+        : snapshot_(snapshot), camera_width_(camera_width), camera_height_(camera_height)
     {
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -83,11 +92,19 @@ public:
     // Snapshot mode. One capture runs from a press of Capture to finish(); the button is locked in between,
     // so a press (or a second browser) while one is running changes nothing.
 
-    // True once per press of Capture, for the main loop to start that capture.
-    bool take_capture()
+    // True once per press of Capture, for the main loop to start that capture. With the browser camera, `picture`
+    // (BGR, as the browser took it) gets the picture that came with the press.
+    bool take_capture(cv::Mat* picture = nullptr)
     {
         int expected = REQUESTED;
-        return state_.compare_exchange_strong(expected, BUSY);
+        if (!state_.compare_exchange_strong(expected, BUSY)) return false;
+        if (picture)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            *picture = upload_;
+            upload_.release();
+        }
+        return true;
     }
 
     // The text under the Capture button; flash makes it blink (used for "Inferencing").
@@ -118,6 +135,13 @@ public:
 private:
     static constexpr size_t MAX_STREAMS = 4; // browsers watching at once
     static constexpr int JPEG_QUALITY = 75;
+    // Browser camera: limits for the request that carries one picture.
+    static constexpr size_t MAX_UPLOAD = 16u << 20;                    // bytes of the JPEG
+    static constexpr long MAX_PIXELS = 16'000'000;                     // width x height the JPEG claims
+    static constexpr size_t MAX_HEADER = 16 * 1024;                    // bytes of request headers
+    static constexpr std::chrono::seconds UPLOAD_TIMEOUT{5};           // for the whole request
+
+    bool browser_camera() const { return snapshot_ && camera_width_ > 0; }
 
     void wake()
     {
@@ -190,12 +214,12 @@ private:
         const std::string route = path.substr(0, path.find('?'));
         const bool get = method == "GET";
 
-        if (get && route == "/stream" && streams.size() < MAX_STREAMS && send_all(fd, STREAM_HEADER))
+        if (get && route == "/stream" && !browser_camera() && streams.size() < MAX_STREAMS && send_all(fd, STREAM_HEADER))
         {
             streams.push_back(fd);
             return;
         }
-        if (get && route == "/") send_all(fd, reply("200 OK", "text/html", snapshot_ ? SNAPSHOT_PAGE : PAGE));
+        if (get && route == "/") send_all(fd, reply("200 OK", "text/html", snapshot_ ? snapshot_page() : PAGE));
         else if (get && !snapshot_ && route.size() == 6 && route.rfind("/key/", 0) == 0 &&
                  std::string("ofr").find(route[5]) != std::string::npos)
         {
@@ -215,20 +239,120 @@ private:
         }
         else if (method == "POST" && snapshot_ && route == "/capture")
         {
-            if (request_capture()) send_all(fd, reply("200 OK", "text/plain", "ok\n"));
+            cv::Mat picture; // empty unless the browser's camera took it
+            std::string error;
+            if (browser_camera() && !read_picture(fd, line, picture, error)) send_all(fd, error);
+            else if (request_capture(picture)) send_all(fd, reply("200 OK", "text/plain", "ok\n"));
             else send_all(fd, reply("409 Conflict", "text/plain", "busy\n"));
         }
-        else if (get && route == "/stream") send_all(fd, reply("503 Service Unavailable", "text/plain", "too many viewers\n"));
+        else if (get && route == "/stream" && !browser_camera())
+            send_all(fd, reply("503 Service Unavailable", "text/plain", "too many viewers\n"));
         else send_all(fd, reply("404 Not Found", "text/plain", "not found\n"));
         ::close(fd);
     }
 
+    // Browser camera: reads the picture of a POST /capture into `picture`. `data` is what the first recv returned;
+    // the rest of the headers and then the Content-Length bytes of the body follow. False, with the whole reply in
+    // `error`, unless that is a complete JPEG of a sensible size that decodes.
+    static bool read_picture(int fd, std::string data, cv::Mat& picture, std::string& error)
+    {
+        const auto fail = [&](const char* status, const char* text)
+        {
+            error = reply(status, "text/plain", std::string(text) + "\n");
+            return false;
+        };
+        const timeval timeout{2, 0}; // the longest pause inside the upload; UPLOAD_TIMEOUT limits the sum
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        const auto deadline = std::chrono::steady_clock::now() + UPLOAD_TIMEOUT;
+        char chunk[16384];
+        const auto receive = [&](std::string& into, size_t most)
+        {
+            if (std::chrono::steady_clock::now() > deadline) return false;
+            const ssize_t n = ::recv(fd, chunk, std::min(sizeof(chunk), most), 0);
+            if (n <= 0) return false;
+            into.append(chunk, static_cast<size_t>(n));
+            return true;
+        };
+
+        size_t end; // of the headers
+        while ((end = data.find("\r\n\r\n")) == std::string::npos)
+        {
+            if (data.size() > MAX_HEADER)
+                return fail("431 Request Header Fields Too Large", "The request headers are too long.");
+            if (!receive(data, sizeof(chunk))) return fail("408 Request Timeout", "The request did not arrive in time.");
+        }
+        std::string head(data, 0, end);
+        for (char& c : head) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const size_t at = head.find("\r\ncontent-length:");
+        const unsigned long long announced =
+            at == std::string::npos ? 0 : std::strtoull(head.c_str() + at + std::strlen("\r\ncontent-length:"), nullptr, 10);
+        if (announced == 0) return fail("400 Bad Request", "There is no picture in the request.");
+        if (announced > MAX_UPLOAD) return fail("413 Payload Too Large", "The picture is too big.");
+
+        const size_t length = static_cast<size_t>(announced);
+        std::string body(data, end + 4, length); // the part that came with the headers
+        body.reserve(length);
+        while (body.size() < length)
+            if (!receive(body, length - body.size()))
+                return fail("408 Request Timeout", "The picture did not arrive in time.");
+
+        long width = 0, height = 0;
+        if (!jpeg_size(body, width, height)) return fail("415 Unsupported Media Type", "The picture must be a JPEG.");
+        if (width * height > MAX_PIXELS) return fail("413 Payload Too Large", "The picture has too many pixels.");
+        try // a tiny file can claim a huge picture, so the size was checked first
+        {
+            picture = cv::imdecode(cv::Mat(1, static_cast<int>(body.size()), CV_8UC1, body.data()), cv::IMREAD_COLOR);
+        }
+        catch (const cv::Exception&)
+        {
+            picture.release();
+        }
+        if (picture.empty()) return fail("400 Bad Request", "The picture could not be decoded.");
+        return true;
+    }
+
+    // Width and height from the frame header of a JPEG, without decoding it; false if `data` is not a JPEG.
+    static bool jpeg_size(const std::string& data, long& width, long& height)
+    {
+        const auto byte = [&](size_t i) { return static_cast<unsigned char>(data[i]); };
+        if (data.size() < 4 || byte(0) != 0xFF || byte(1) != 0xD8) return false; // no start-of-image marker
+        for (size_t i = 2; i + 4 <= data.size();)
+        {
+            if (byte(i) != 0xFF) return false;
+            const int marker = byte(i + 1);
+            if (marker == 0xFF) // padding before a marker
+            {
+                ++i;
+                continue;
+            }
+            if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8)) // markers that have no length
+            {
+                i += 2;
+                continue;
+            }
+            const size_t length = (static_cast<size_t>(byte(i + 2)) << 8) | byte(i + 3);
+            const bool frame = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+            if (frame)
+            {
+                if (i + 9 > data.size()) return false;
+                height = (byte(i + 5) << 8) | byte(i + 6);
+                width = (byte(i + 7) << 8) | byte(i + 8);
+                return true;
+            }
+            if (marker == 0xDA || length < 2) return false; // the picture data starts without a frame header
+            i += 2 + length;
+        }
+        return false;
+    }
+
     // Locks the Capture button and shows "Inferencing" at once; false if a capture is already running.
-    bool request_capture()
+    // `upload` is the picture that came with the press (browser camera), for take_capture().
+    bool request_capture(const cv::Mat& upload)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         int expected = READY;
         if (!state_.compare_exchange_strong(expected, REQUESTED)) return false;
+        upload_ = upload;
         status_ = "Inferencing...";
         flash_ = true;
         return true;
@@ -282,7 +406,8 @@ document.onkeydown = e => { const k = e.key.toLowerCase(); if (k === 'o' || k ==
 
     // Snapshot mode: the live video and the last result side by side, one Capture button (no keyboard shortcut,
     // so a stray key cannot move the hand). The page asks /state four times a second and unlocks the button only
-    // when the server says so.
+    // when the server says so. With the browser camera (snapshot_page() fills in CAM) the live pane is the
+    // browser's own camera, mirrored like the stream, and Capture sends one picture of it to the server.
     static constexpr const char* SNAPSHOT_PAGE = R"html(<!doctype html>
 <html><head><meta charset="utf-8"><title>DH116 Mimic - snapshot</title>
 <style>
@@ -290,26 +415,66 @@ body{margin:0;background:#111;color:#ddd;font:16px sans-serif;text-align:center}
 .panes{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px}
 @media(max-width:800px){.panes{grid-template-columns:1fr}}
 .pane{position:relative;background:#000;aspect-ratio:4/3}
-.pane img{width:100%;height:100%;object-fit:contain;display:block}
-.pane b{position:absolute;left:8px;top:6px;padding:2px 8px;border-radius:4px;background:#000a;font-weight:normal;font-size:14px}
+.pane img,.pane video{width:100%;height:100%;object-fit:contain;display:block}
+.pane video{transform:scaleX(-1)}
+.pane b{position:absolute;right:8px;top:6px;padding:2px 8px;border-radius:4px;background:#000a;font-weight:normal;font-size:14px;z-index:1}
 #shot{display:none}
 #none{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888}
 button{font-size:24px;margin:8px;padding:12px 40px}
-#msg{min-height:1.6em;padding-bottom:12px;font-size:20px}
+#msg{min-height:1.6em;padding:0 12px 12px;font-size:20px}
 .flash{color:#ffb74d;animation:blink .8s ease-in-out infinite}
 @keyframes blink{50%{opacity:.2}}
 </style></head>
 <body>
 <div class="panes">
-<div class="pane"><b>Live</b><img src="/stream" alt="live camera"></div>
+<div class="pane"><b>Live</b><img id="live" alt="live camera"><video id="cam" autoplay muted playsinline></video></div>
 <div class="pane"><b>Last capture</b><img id="shot" alt="last capture"><div id="none">No capture yet</div></div>
 </div>
 <button id="go" disabled>Capture</button>
 <div id="msg">Connecting...</div>
 <script>
+const CAM = /*CAM*/{browser: false};
 const goBtn = document.getElementById('go'), msgEl = document.getElementById('msg');
 const shotImg = document.getElementById('shot'), noneEl = document.getElementById('none');
+const liveImg = document.getElementById('live'), video = document.getElementById('cam');
 let seen = 0, polling = false, epoch = 0;
+let camError = ''; // browser camera: why it cannot be used
+let problem = '';  // browser camera: why the last picture was not accepted; shown until the next press
+const camReady = () => !CAM.browser || (!camError && video.videoWidth > 0 && video.readyState >= 2);
+
+async function startCamera() {
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    const p = location.port || '80';
+    camError = 'A browser allows its camera only on https:// or http://localhost. On this computer run: ssh -L ' + p +
+      ':localhost:' + p + ' <user>@' + location.hostname + ' and open http://localhost:' + p + '/';
+    return;
+  }
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia(
+      {video: {width: {ideal: CAM.width}, height: {ideal: CAM.height}}, audio: false});
+  } catch (e) {
+    camError = 'The camera is not available (' + e.name + (e.message ? ': ' + e.message : '') +
+      '). Allow it for this page and reload.';
+  }
+}
+// One picture of the camera as JPEG: the raw frame, not the mirrored view on the page.
+function grab() {
+  return new Promise((resolve, reject) => {
+    const w = video.videoWidth, h = video.videoHeight;
+    if (!camReady()) return reject(new Error('the camera is not ready'));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+    canvas.toBlob(b => b ? resolve(b) : reject(new Error('the picture could not be encoded')), 'image/jpeg', 0.92);
+  });
+}
+// What goes under the button: [text, flashing].
+function describe(s) {
+  if (!camReady()) return [camError || 'Waiting for the camera. Allow it in the browser if it asks.', false];
+  if (problem && s.ready) return [problem, false];
+  return [s.text, s.flash];
+}
 async function poll() {
   if (polling) return;
   polling = true;
@@ -317,9 +482,10 @@ async function poll() {
   try {
     const s = await (await fetch('/state')).json();
     if (mine !== epoch) return; // the button was pressed meanwhile: this answer may be older than the press
-    goBtn.disabled = !s.ready;
-    msgEl.textContent = s.text;
-    msgEl.className = s.flash ? 'flash' : '';
+    const [text, flash] = describe(s);
+    goBtn.disabled = !s.ready || !camReady();
+    msgEl.textContent = text;
+    msgEl.className = flash ? 'flash' : '';
     if (s.shot !== seen) {
       seen = s.shot;
       shotImg.src = '/shot.jpg?n=' + seen;
@@ -336,22 +502,53 @@ async function poll() {
 }
 goBtn.onclick = async () => {
   goBtn.disabled = true;
+  problem = '';
   msgEl.textContent = 'Inferencing...';
   msgEl.className = 'flash';
   epoch++;
-  try { await fetch('/capture', {method: 'POST'}); } catch (e) {}
+  try {
+    const request = {method: 'POST'};
+    if (CAM.browser) {
+      request.headers = {'Content-Type': 'image/jpeg'};
+      request.body = await grab();
+    }
+    const r = await fetch('/capture', request);
+    if (!r.ok && r.status !== 409) problem = (await r.text()).trim() || 'The picture was refused (' + r.status + ').';
+  } catch (e) {
+    if (CAM.browser) problem = 'Capture failed: ' + e.message + '.';
+  }
   epoch++;
   goBtn.blur();
   poll();
 };
+if (CAM.browser) {
+  liveImg.remove();
+  startCamera();
+} else {
+  video.remove();
+  liveImg.src = '/stream';
+}
 setInterval(poll, 250);
 poll();
 </script></body></html>
 )html";
 
+    // The page for the snapshot mode; the server fills in whether the camera is the browser's, and at what size.
+    std::string snapshot_page() const
+    {
+        std::string page = SNAPSHOT_PAGE;
+        const std::string off = "/*CAM*/{browser: false}";
+        const size_t at = page.find(off);
+        if (browser_camera() && at != std::string::npos)
+            page.replace(at, off.size(),
+                         "{browser: true, width: " + std::to_string(camera_width_) + ", height: " + std::to_string(camera_height_) + "}");
+        return page;
+    }
+
     enum State { READY, REQUESTED, BUSY }; // snapshot mode: Capture pressed -> main loop took it -> finish()
 
     const bool snapshot_;
+    const int camera_width_, camera_height_; // browser camera: the size asked of it; 0 = the pictures come from this machine
     int listen_fd_ = -1;
     int wake_[2] = {-1, -1}; // pipe that wakes the server thread for a new image or to stop
     std::atomic<bool> running_{true};
@@ -360,6 +557,7 @@ poll();
     std::mutex mutex_;
     cv::Mat image_;      // newest image; guarded by mutex_
     uint64_t count_ = 0; // images published; guarded by mutex_
+    cv::Mat upload_;     // browser camera: the picture of the last press, until take_capture() takes it; guarded by mutex_
     std::string status_ = "Ready. Press Capture."; // snapshot mode, guarded by mutex_
     bool flash_ = false;
     std::string shot_;       // JPEG of the last capture's result

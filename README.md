@@ -125,10 +125,11 @@ ORT_MLAS_RISCV_FORCE_SCALAR=1 build/native/hand_cam --bench --threads 4 --model-
 | drive the hand | `DH116_IFACE=enp0s31f6 ./scripts/run.sh` |
 | use another camera or UDP port | `--camera 1`, `--port 5007` |
 | lower the camera frame rate | `--fps 15` (default 30; the camera driver may ignore it) |
-| use other models | `--palm-model FILE --landmark-model FILE` (input size is read from the model), or `--model-dir DIR` for `hand_palm.onnx` and `hand_landmark_detector.onnx` |
+| use other models | `--palm-model FILE --landmark-model FILE` (input size is read from the model), or `--model-dir DIR` for `palm.onnx` and `landmark.onnx` |
 | change speed, current, deadband | `CTRL_ARGS="--current 300 --deadband 80"` (see below) |
 | see the preview in a browser | `--web 8080` |
 | one image per button press, not real time | `--web 8080 --snapshot` |
+| the same, with the picture from a laptop's webcam instead of a camera on the board | `--camera browser --web 8008 --snapshot`, with an ssh tunnel (see below) |
 
 Options that `run.sh` does not know are passed to `hand_cam`. `run.sh` itself starts it with `--width 640 --height 480 --threads 4 --det-every 30 --model-dir models`; repeat any of them to override (the last value wins).
 
@@ -139,6 +140,19 @@ Camera options such as `--camera 1`, `--hand right`, `--flip-input`, `--no-previ
 `--web 8080 --snapshot` is the not-real-time mode (`--snapshot` needs `--web`). The page shows the live camera next to the last capture, with a **Capture** button. One press takes the newest camera frame and runs the palm detector and the landmark net on it once; the status line flashes "Inferencing..." until they are done. If no hand of the `--hand` side is found, the page says so and nothing is sent. Otherwise the landmarks are drawn on the captured image, and one command goes to `mimic_ctrl` (after a message with no hand, so that its filter starts afresh and the command is the pose of this image, not blended with the last one). The button stays locked until the fingers have reached their targets, plus 2 s, so one press moves the hand once. A second press, or another browser, while a capture is in progress is refused. While it waits, `hand_cam` sends status requests every 100 ms; they move nothing. The waits are bounded: 1 s for `mimic_ctrl` to answer at all, 6 s for the fingers to arrive (then the page says they did not), each followed by the 2 s. A dry run reports no finger positions (and neither does a hand without position feedback), so there is nothing to wait for and the button unlocks 2 s after `mimic_ctrl` confirmed the command.
 
 There are no `O`/`F`/`R` keys in this mode: `mimic_ctrl` keeps the calibration it loaded, which is `hand_calibration.json` if that file exists, else the built-in defaults. To force the defaults, give `mimic_ctrl` a file that does not exist, for example `DH116_IFACE=enp0s31f6 CTRL_ARGS="--calibration none.json" ./scripts/run.sh --web 8080 --snapshot`; the last `--calibration` wins and the file is not created. `--frames`, `--det-every`, `--freeze-crop` and `--profile` have no effect here. The security note above applies even more: anyone who reaches the port can press Capture and so move the hand.
+
+`--camera browser` (needs `--web` and `--snapshot`) takes the picture from the camera of the computer whose browser opens the page, so a laptop's webcam can feed a board that has no camera. The page shows that camera live, mirrored like the other previews; nothing is streamed to the board. One press of **Capture** sends one still frame to `hand_cam` as a JPEG, and everything after that is as described above: the two nets run once on it, the landmarks are drawn on it, one command goes to `mimic_ctrl`, and the button unlocks when the fingers have arrived plus 2 s. `--hand` (the left hand unless you say otherwise) decides which hand counts: a picture of the other one gets "No left hand found (a right hand was seen)" and nothing is sent. `--width` and `--height` are the size asked from the browser's camera (it may pick a nearby one), and `--flip-input` mirrors the picture as for a board camera.
+
+A browser hands its camera only to pages from `https://` or from `http://localhost`, so on `http://<board-ip>:8008/` the page says that the camera is not available. Make the page `localhost` with an ssh tunnel, started on the laptop and kept open:
+
+```bash
+ssh -L 8008:localhost:8008 user@<board-ip>
+# then open http://localhost:8008/ in the laptop's browser and allow the camera
+```
+
+The laptop and the board need an IP link besides the EtherCAT cable, which is not a network: a second Ethernet port or a USB Ethernet adapter on the board, or Wi-Fi. Through a switch, fixed addresses on a private subnet with no gateway are enough, for example `192.168.50.1/24` on the laptop and `192.168.50.2/24` on the board. Do not plug the hand's EtherCAT cable into that switch, and give `DH116_IFACE` the EtherCAT port only.
+
+`hand_cam` takes a JPEG of at most 16 MiB and 16 megapixels that arrives within 5 s, and refuses anything else with a short message that the page shows (for example "The picture must be a JPEG."). The security note above applies once more, in a stronger form: anyone who can reach the port can upload a picture and so choose the pose the hand takes. The ssh tunnel only gives the browser a `localhost` address; the server still listens on every interface, so on a shared network keep the port closed to others with a firewall.
 
 Controller options can be supplied with `CTRL_ARGS`, for example:
 ```bash
@@ -167,6 +181,8 @@ Then run it with the same `run.sh` options as the native build:
 ./run.sh --dry-run --camera 0                          # camera and inference only; no EtherCAT
 DH116_IFACE=eth1 ./run.sh --camera 0 --hand left       # hardware run; root, or sudo for EtherCAT
 DH116_IFACE=eth1 ./run.sh --camera 0 --web 8080        # same, preview at http://<board-ip>:8080/
+# no camera on the board: one picture per press from the laptop's webcam (ssh tunnel, see Run)
+DH116_IFACE=eth1 ./run.sh --camera browser --web 8008 --snapshot
 ```
 
 To start the programs by hand instead:
@@ -178,7 +194,7 @@ To start the programs by hand instead:
 sudo ./bin/mimic_ctrl eth1 --calibration hand_calibration.json      # hardware; instead of --dry-run
 ```
 
-`--model-dir` is the directory that holds `hand_palm.onnx` and `hand_landmark_detector.onnx` (default `models`); `--palm-model` and `--landmark-model` name the two files directly. Float models and the Qualcomm w8a8 (uint8) models in `models/Qualcomm-w8a8/` both work; the uint8 models' quantisation constants are fixed in `hand_cam.cpp` (they come from that folder's `metadata.json`). `--freeze-crop F` (default 0.03) keeps the hand crop while the hand box moves less than F of its size, so a still hand is cropped the same way every frame and stays steady; `--freeze-crop 0` re-crops every frame. Lower `--width`, `--height`, `--fps`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
+`--model-dir` is the directory that holds `palm.onnx` and `landmark.onnx` (default `models`); `--palm-model` and `--landmark-model` name the two files directly. Float models and the Qualcomm w8a8 (uint8) models in `models/Qualcomm-w8a8/` both work; the uint8 models' quantisation constants are fixed in `hand_cam.cpp` (they come from that folder's `metadata.json`). `--freeze-crop F` (default 0.03) keeps the hand crop while the hand box moves less than F of its size, so a still hand is cropped the same way every frame and stays steady; `--freeze-crop 0` re-crops every frame. Lower `--width`, `--height`, `--fps`, or `--det-every` rates if the frame rate is too low, and match `--threads` to the board's core count.
 
 To estimate inference time on any device before building anything, run `python3 scripts/bench_models.py` (needs only `pip install onnxruntime numpy`). It times both networks for several thread counts and prints the expected per-frame model cost; `--threads 1,2,4,8` sweeps counts and `taskset -c ...` pins it to chosen cores.
 
@@ -216,8 +232,8 @@ The real frame rate cannot exceed the camera's, because each loop waits for a ne
 | [scripts/build-riscv.sh](scripts/build-riscv.sh) | Cross-builds the static riscv64 (RVA23) bundle. |
 | [cmake/toolchains/](cmake/toolchains/) | CMake toolchain file for the riscv64 build. |
 | [scripts/run.sh](scripts/run.sh) | Supervises the camera/controller processes; runs `scripts/build.sh` if needed; a copy also runs inside the riscv64 bundle. |
-| [src/hand_cam.cpp](src/hand_cam.cpp) | Camera capture, palm and landmark networks, preview, and UDP to the controller; `--snapshot` runs one capture and one command per button press. |
-| [include/web_view.h](include/web_view.h) | `hand_cam --web`: the preview as an MJPEG stream for a web browser, and the calibration keys from it; with `--snapshot`, the Capture page and the state of the capture instead. |
+| [src/hand_cam.cpp](src/hand_cam.cpp) | Camera capture, palm and landmark networks, preview, and UDP to the controller; `--snapshot` runs one capture and one command per button press, with the picture from the board's camera or, with `--camera browser`, from the browser. |
+| [include/web_view.h](include/web_view.h) | `hand_cam --web`: the preview as an MJPEG stream for a web browser, and the calibration keys from it; with `--snapshot`, the Capture page and the state of the capture instead, and with `--camera browser` the upload of the JPEG that the page takes from its own camera. |
 | [src/mimic_ctrl.c](src/mimic_ctrl.c) | Controller main loop: UDP from `hand_cam`, landmarks to targets, deadband, log line. |
 | [src/dh116.c](src/dh116.c), [include/dh116.h](include/dh116.h) | The hand on EtherCAT (SOEM): start-up, 10 ms cycle, frames sent to the hand, feedback and joint status, opening the fingers, shutdown. |
 | [src/hand_math.c](src/hand_math.c), [include/hand_math.h](include/hand_math.h) | Landmarks to finger closure, calibration file, One-Euro filter. |

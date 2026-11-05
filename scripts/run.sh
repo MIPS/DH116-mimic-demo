@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/run.sh [--dry-run] [--camera N] [--port N] [hand_cam options]
+Usage: ./scripts/run.sh [--dry-run] [--camera N|browser] [--port N] [hand_cam options]
 
 Starts mimic_ctrl (EtherCAT controller) and hand_cam (camera + neural nets) together;
 when either one exits, the other is stopped.
@@ -13,11 +13,14 @@ Examples:
   DH116_IFACE=enp0s31f6 ./scripts/run.sh           drive the hand (see `ip -brief link`)
   ./scripts/run.sh --dry-run --fps 15 --web 8080   any other option goes to hand_cam (see hand_cam --help)
   ./scripts/run.sh --dry-run --web 8080 --snapshot not real time: one image per Capture press
+  ./scripts/run.sh --dry-run --camera browser --web 8008 --snapshot
+                                                   the picture comes from the webcam of the computer whose
+                                                   browser opens the page (ssh -L 8008:localhost:8008 user@board)
   ./scripts/run.sh --dry-run --palm-model a.onnx --landmark-model b.onnx
 
 Options (everything else is passed to hand_cam):
   --dry-run            no EtherCAT
-  --camera N           camera index (default 0), same as DH116_CAMERA
+  --camera N           camera index (default 0), same as DH116_CAMERA; "browser" needs --web and --snapshot
   --port N             UDP port shared by both programs (default 5006), same as MIMIC_PORT
   --profile            goes to both: hand_cam prints its stage times, mimic_ctrl logs the joint currents
 
